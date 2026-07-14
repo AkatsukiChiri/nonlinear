@@ -10,7 +10,7 @@ from typing import Callable
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from layers.fused_square_linear import fused_square_linear_fp16
 

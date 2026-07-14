@@ -1,11 +1,14 @@
-"""Inference-only fused RMSNorm and bias-free Linear layer."""
+"""Inference-only fused RMSNorm and Linear layer."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from layers.fused_square_linear import fused_square_linear_fp16
+from .cuda import (
+    fused_rmsnorm_linear_bias_fp16,
+    fused_rmsnorm_linear_fp16,
+)
 
 
 DEFAULT_EPS = 1e-6
@@ -23,23 +26,25 @@ def _get_rmsnorm_eps(rmsnorm: nn.Module, dtype: torch.dtype) -> float:
 
 
 class FusedRMSNormLinear(nn.Module):
-    """Fuse a frozen RMSNorm and bias-free Linear projection for inference.
+    """Fuse a frozen RMSNorm and Linear projection for inference.
 
     At construction, the RMSNorm scale is absorbed into the Linear weight and
-    an all-ones row is appended::
+    stored once::
 
-        augmented_weight = cat([linear.weight * rmsnorm.weight, ones], dim=0)
+        fused_weight = linear.weight * rmsnorm.weight
 
-    For an input ``x`` shaped [Batch, 1, HiddenDim], the CUDA kernel computes
-    both ``x @ augmented_weight.T`` and
-    ``x.square() @ augmented_weight.T``. The former supplies the projected
-    numerator, while the final element of the latter is ``sum(x.square())``.
+    For an input ``x`` shaped [Batch, 1, HiddenDim], the specialized CUDA path
+    computes ``x @ fused_weight.T`` and one FP32 ``sum(x.square())`` reduction,
+    then applies the inverse RMS scale in a lightweight CUDA epilogue. If the
+    source Linear has a bias, it is added after RMS scaling, matching
+    ``linear(rmsnorm(x))``.
 
     The source modules are not retained. Their weights are snapshotted into a
     registered buffer, so this layer is intended for fixed-weight inference.
     """
 
     fused_weight: torch.Tensor
+    bias: torch.Tensor | None
 
     def __init__(self, rmsnorm: nn.Module, linear: nn.Linear) -> None:
         super().__init__()
@@ -47,8 +52,6 @@ class FusedRMSNormLinear(nn.Module):
         rmsnorm_weight = getattr(rmsnorm, "weight", None)
         if not isinstance(rmsnorm_weight, torch.Tensor):
             raise TypeError("rmsnorm must expose a tensor weight")
-        if linear.bias is not None:
-            raise ValueError("FusedRMSNormLinear currently requires bias=False")
         if rmsnorm_weight.ndim != 1:
             raise ValueError("rmsnorm.weight must have shape [HiddenDim]")
         if linear.weight.ndim != 2:
@@ -71,14 +74,11 @@ class FusedRMSNormLinear(nn.Module):
 
         with torch.no_grad():
             projected_weight = linear.weight * rmsnorm_weight.unsqueeze(0)
-            sum_weight = torch.ones(
-                1,
-                self.hidden_dim,
-                dtype=projected_weight.dtype,
-                device=projected_weight.device,
-            )
-            fused_weight = torch.cat((projected_weight, sum_weight), dim=0)
-        self.register_buffer("fused_weight", fused_weight.contiguous())
+        self.register_buffer("fused_weight", projected_weight.contiguous())
+        self.register_buffer(
+            "bias",
+            None if linear.bias is None else linear.bias.detach().clone().contiguous(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply fused RMSNorm and Linear.
@@ -99,11 +99,11 @@ class FusedRMSNormLinear(nn.Module):
         if x.dtype != self.fused_weight.dtype:
             raise TypeError("x and fused_weight must have the same dtype")
 
-        # [Batch, 2, OutDim + 1]
-        fused_output = fused_square_linear_fp16(x, self.fused_weight)
-        numerator = fused_output[:, 0, : self.out_dim]
-        square_sum = fused_output[:, 1, self.out_dim].float()
-
-        inverse_rms = torch.rsqrt(square_sum / self.hidden_dim + self.eps)
-        output = numerator.float() * inverse_rms.unsqueeze(1)
-        return output.to(dtype=x.dtype).unsqueeze(1)
+        if self.bias is not None:
+            return fused_rmsnorm_linear_bias_fp16(
+                x,
+                self.fused_weight,
+                self.bias,
+                self.eps,
+            )
+        return fused_rmsnorm_linear_fp16(x, self.fused_weight, self.eps)

@@ -25,7 +25,7 @@ def _load_extension() -> ModuleType:
     if _EXTENSION is not None:
         return _EXTENSION
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     cutlass_path = _cutlass_path()
     cute_header = cutlass_path / "include" / "cute" / "tensor.hpp"
     if not cute_header.exists():
@@ -40,8 +40,18 @@ def _load_extension() -> ModuleType:
     _EXTENSION = load(
         name="nonlinear_fused_square_linear",
         sources=[
-            str(root / "kernels" / "fused_square_linear.cpp"),
-            str(root / "kernels" / "fused_square_linear.cu"),
+            str(
+                root
+                / "kernels"
+                / "fused_square_linear"
+                / "fused_square_linear.cpp"
+            ),
+            str(
+                root
+                / "kernels"
+                / "fused_square_linear"
+                / "fused_square_linear.cu"
+            ),
         ],
         extra_include_paths=[
             str(cutlass_path / "include"),

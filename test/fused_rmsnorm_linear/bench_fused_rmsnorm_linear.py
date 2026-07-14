@@ -11,7 +11,7 @@ from typing import Callable
 import torch
 from torch import nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from layers.fused_rmsnorm_linear import FusedRMSNormLinear
 
@@ -62,6 +62,12 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument(
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="benchmark a Linear with bias (default: --no-bias)",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -81,7 +87,7 @@ def main() -> None:
     linear = nn.Linear(
         args.hidden_dim,
         args.out_dim,
-        bias=False,
+        bias=args.bias,
         device=device,
         dtype=dtype,
     ).eval()
@@ -116,7 +122,7 @@ def main() -> None:
         print(f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
         print(
             f"B={args.batch}, K={args.hidden_dim}, N={args.out_dim}, "
-            f"eps={args.eps:g}"
+            f"eps={args.eps:g}, bias={args.bias}"
         )
         print(f"fused weight shape: {tuple(fused_layer.fused_weight.shape)}")
 

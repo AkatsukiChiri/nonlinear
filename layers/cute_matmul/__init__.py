@@ -24,7 +24,7 @@ def _load_extension():
     if _EXTENSION is not None:
         return _EXTENSION
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
     cutlass_path = _cutlass_path()
     cute_header = cutlass_path / "include" / "cute" / "tensor.hpp"
@@ -37,8 +37,8 @@ def _load_extension():
     _EXTENSION = load(
         name="nonlinear_cute_matmul",
         sources=[
-            str(root / "kernels" / "cute_matmul.cpp"),
-            str(root / "kernels" / "cute_matmul.cu"),
+            str(root / "kernels" / "cute_matmul" / "cute_matmul.cpp"),
+            str(root / "kernels" / "cute_matmul" / "cute_matmul.cu"),
         ],
         extra_include_paths=[
             str(cutlass_path / "include"),
