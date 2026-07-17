@@ -15,6 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from layers.fused_rmsnorm_linear import FusedRMSNormLinear
 from layers.fused_rmsnorm_linear_int8 import FusedRMSNormLinearInt8
+from layers.fused_rmsnorm_linear_weight_only_int8_dequant import (
+    FusedRMSNormLinearWeightOnlyInt8Dequant,
+)
+from layers.fused_rmsnorm_linear_weight_only_int8_mixed import (
+    FusedRMSNormLinearWeightOnlyInt8Mixed,
+)
 
 
 def _measure(
@@ -99,6 +105,8 @@ def main() -> None:
 
     fp16_fused_layer = FusedRMSNormLinear(rmsnorm, linear).eval()
     int8_fused_layer = FusedRMSNormLinearInt8(rmsnorm, linear).eval()
+    mixed_layer = FusedRMSNormLinearWeightOnlyInt8Mixed(rmsnorm, linear).eval()
+    dequant_layer = FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
     x = torch.randn(
         args.batch,
         1,
@@ -113,11 +121,19 @@ def main() -> None:
     def fp16_fused_forward() -> torch.Tensor:
         return fp16_fused_layer(x)
 
+    def mixed_forward() -> torch.Tensor:
+        return mixed_layer(x)
+
+    def dequant_forward() -> torch.Tensor:
+        return dequant_layer(x)
+
     def pytorch_fp16_forward() -> torch.Tensor:
         return linear(rmsnorm(x))
 
     with torch.inference_mode():
         int8_check = int8_fused_forward()
+        mixed_check = mixed_forward()
+        dequant_check = dequant_forward()
         fp16_fused_check = fp16_fused_forward()
         pytorch_check = pytorch_fp16_forward()
         torch.testing.assert_close(
@@ -132,6 +148,8 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
+        torch.testing.assert_close(mixed_check, pytorch_check, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dequant_check, pytorch_check, atol=5e-2, rtol=5e-2)
 
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
@@ -147,6 +165,16 @@ def main() -> None:
 
         int8_output, int8_times = _measure(
             int8_fused_forward,
+            args.warmup,
+            args.iterations,
+        )
+        mixed_output, mixed_times = _measure(
+            mixed_forward,
+            args.warmup,
+            args.iterations,
+        )
+        dequant_output, dequant_times = _measure(
+            dequant_forward,
             args.warmup,
             args.iterations,
         )
@@ -172,9 +200,13 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
+        torch.testing.assert_close(mixed_output, pytorch_output, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dequant_output, pytorch_output, atol=5e-2, rtol=5e-2)
 
     operations = 2 * args.batch * args.hidden_dim * args.out_dim
     _report("INT8 FusedRMSNormLinear", int8_times, operations)
+    _report("INT8 weight-only FP32 mixed", mixed_times, operations)
+    _report("INT8 weight-only FP16 dequant", dequant_times, operations)
     _report("FP16 FusedRMSNormLinear", fp16_fused_times, operations)
     _report("PyTorch FP16 RMSNorm+Linear", pytorch_times, operations)
     int8_mean = statistics.mean(int8_times)
@@ -186,6 +218,19 @@ def main() -> None:
         "INT8 speedup vs PyTorch FP16: "
         f"{statistics.mean(pytorch_times) / int8_mean:.3f}x"
     )
+    for name, timings in (
+        ("weight-only FP32 mixed", mixed_times),
+        ("weight-only FP16 dequant", dequant_times),
+    ):
+        mean = statistics.mean(timings)
+        print(
+            f"{name} speedup vs FP16 fused: "
+            f"{statistics.mean(fp16_fused_times) / mean:.3f}x"
+        )
+        print(
+            f"{name} speedup vs PyTorch FP16: "
+            f"{statistics.mean(pytorch_times) / mean:.3f}x"
+        )
 
 
 if __name__ == "__main__":
