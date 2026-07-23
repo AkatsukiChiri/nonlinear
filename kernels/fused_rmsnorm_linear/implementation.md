@@ -11,7 +11,7 @@
 - `kernels/fused_rmsnorm_linear/fused_rmsnorm_linear.cpp`：PyTorch C++ binding 与参数检查。
 - `kernels/fused_rmsnorm_linear/fused_rmsnorm_linear.cu`：projection、平方和与 RMS scaling kernel。
 - `test/fused_rmsnorm_linear/test_fused_rmsnorm_linear.py`：正确性测试。
-- `test/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py`：与原生 PyTorch 实现的性能对比。
+- `benchmark/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py`：与原生 PyTorch 实现的性能对比。
 
 ## 1. 目标计算
 
@@ -422,14 +422,14 @@ pytest -q test/fused_rmsnorm_linear/test_fused_rmsnorm_linear.py
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python test/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py
+python benchmark/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py
 ```
 
 更稳定的测试可增加 warmup 和 iteration：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python test/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py \
+python benchmark/fused_rmsnorm_linear/bench_fused_rmsnorm_linear.py \
   --batch 1 \
   --hidden-dim 4096 \
   --out-dim 4096 \

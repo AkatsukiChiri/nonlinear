@@ -30,7 +30,7 @@ echo "K=${HIDDEN_DIM}, N=${OUT_DIM}, warmup=${WARMUP}, iterations=${ITERATIONS}"
 for batch in ${BATCH_SIZES}; do
   echo
   echo "========== Batch ${batch} =========="
-  "${PYTHON_CMD[@]}" test/fused_square_linear/bench_fused_square_linear.py \
+  "${PYTHON_CMD[@]}" benchmark/fused_square_linear/bench_fused_square_linear.py \
     --batch "${batch}" \
     --hidden-dim "${HIDDEN_DIM}" \
     --out-dim "${OUT_DIM}" \

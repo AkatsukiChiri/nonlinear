@@ -20,7 +20,8 @@ directories according to their purpose:
 - `layers/`: PyTorch modules and wrapper layers, especially RMSNorm and
   LayerNorm implementations.
 - `kernels/`: CUDA, CuTe, CUTLASS, and C++ GPU kernel implementations.
-- `test/`: Correctness validation, unit tests, benchmark drivers, and profiling
+- `test/`: Correctness validation and unit tests.
+- `benchmark/`: Performance benchmarks, benchmark launchers, and profiling
   scripts.
 
 Do not place tests, kernels, model code, generated logs, build outputs, or
@@ -32,7 +33,7 @@ Use the `nonl` conda environment for all Python execution and tests:
 
 ```bash
 conda run -n nonl --no-capture-output pytest test/
-conda run -n nonl --no-capture-output python kernels/bench.py
+conda run -n nonl --no-capture-output python benchmark/vllm/bench_vllm_norm.py --help
 ```
 
 Do not assume dependencies are installed globally. Do not install, upgrade, or
@@ -67,8 +68,10 @@ modify packages in the environment unless the user explicitly asks for that.
 
 ## Testing
 
-Place all tests and verification scripts under `test/`. Do not add tests in the
-repository root or next to implementation files.
+Place correctness tests and verification scripts under `test/`. Place timing,
+throughput, profiling, and performance-comparison scripts under `benchmark/`.
+Do not mix benchmark files into `test/`, and do not add either kind of file in
+the repository root or next to implementation files.
 
 When adding or modifying an RMSNorm or LayerNorm layer or kernel:
 
@@ -82,9 +85,9 @@ When adding or modifying an RMSNorm or LayerNorm layer or kernel:
 conda run -n nonl --no-capture-output pytest test/
 ```
 
-Benchmarking or profiling scripts may also live in `test/` when they validate
-normalization behavior or performance. Keep generated logs and binary build
-artifacts out of the repository unless explicitly requested.
+Keep benchmark and profiling scripts under `benchmark/`, mirroring the relevant
+feature subdirectory under `test/` when practical. Keep generated traces, logs,
+and binary build artifacts out of the repository unless explicitly requested.
 
 ## Development Workflow
 
