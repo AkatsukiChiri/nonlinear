@@ -41,6 +41,7 @@ def _load_extension() -> ModuleType:
             "-O3",
             "-std=c++17",
             "--use_fast_math",
+            "-Xptxas=-dlcm=cg",
             "-lineinfo",
         ],
         verbose=os.environ.get("NONLINEAR_VERBOSE_BUILD", "0") == "1",

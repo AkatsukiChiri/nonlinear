@@ -5,6 +5,13 @@ namespace nonlinear {
 
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
+constexpr int kDirectWarps = 32;
+constexpr int kDirectThreads = kDirectWarps * 32;
+
+union Half8Pack {
+  uint4 vector;
+  half2 pairs[4];
+};
 
 template <int Batch>
 __global__ __launch_bounds__(kThreads) void fused_projection_square_sum_kernel(
@@ -63,7 +70,49 @@ __global__ __launch_bounds__(kThreads) void fused_projection_square_sum_kernel(
 
   float accumulator[Batch] = {};
   const half* weight_row = weight + output_index * hidden_dim;
-  if ((hidden_dim & 1) == 0) {
+  if ((hidden_dim & 7) == 0) {
+    float accumulator_streams[4][Batch] = {};
+    const int vector_count = hidden_dim / 8;
+    for (int vector_index = lane; vector_index < vector_count;
+         vector_index += 32) {
+      Half8Pack weight_pack;
+      weight_pack.vector =
+          reinterpret_cast<const uint4*>(weight_row)[vector_index];
+      Half8Pack x_pack[Batch];
+#pragma unroll
+      for (int batch_index = 0; batch_index < Batch; ++batch_index) {
+        x_pack[batch_index].vector =
+            reinterpret_cast<const uint4*>(
+                x + batch_index * hidden_dim)[vector_index];
+      }
+#pragma unroll
+      for (int pair_index = 0; pair_index < 4; ++pair_index) {
+        const float2 weight_value =
+            __half22float2(weight_pack.pairs[pair_index]);
+#pragma unroll
+        for (int batch_index = 0; batch_index < Batch; ++batch_index) {
+          const float2 x_value =
+              __half22float2(x_pack[batch_index].pairs[pair_index]);
+          accumulator_streams[pair_index][batch_index] = fmaf(
+              x_value.x,
+              weight_value.x,
+              accumulator_streams[pair_index][batch_index]);
+          accumulator_streams[pair_index][batch_index] = fmaf(
+              x_value.y,
+              weight_value.y,
+              accumulator_streams[pair_index][batch_index]);
+        }
+      }
+    }
+#pragma unroll
+    for (int batch_index = 0; batch_index < Batch; ++batch_index) {
+      accumulator[batch_index] =
+          accumulator_streams[0][batch_index] +
+          accumulator_streams[1][batch_index] +
+          accumulator_streams[2][batch_index] +
+          accumulator_streams[3][batch_index];
+    }
+  } else if ((hidden_dim & 1) == 0) {
     const int pair_count = hidden_dim / 2;
     for (int pair_index = lane; pair_index < pair_count; pair_index += 32) {
       const float2 weight_value = __half22float2(
@@ -144,6 +193,93 @@ __global__ void rms_scale_bias_kernel(
   }
 }
 
+__global__ __launch_bounds__(kDirectThreads)
+void fused_rmsnorm_direct_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    const half* __restrict__ bias,
+    half* __restrict__ output,
+    int out_dim,
+    int hidden_dim,
+    float eps) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int output_index = blockIdx.x * kDirectWarps + warp;
+  if (output_index >= out_dim) return;
+
+  float projection = 0.0f;
+  float square_sum = 0.0f;
+  const half* weight_row = weight + output_index * hidden_dim;
+  if ((hidden_dim & 7) == 0) {
+    float projection_streams[4] = {};
+    float square_streams[4] = {};
+    const int vector_count = hidden_dim / 8;
+    for (int vector_index = lane; vector_index < vector_count;
+         vector_index += 32) {
+      Half8Pack weight_pack;
+      Half8Pack x_pack;
+      weight_pack.vector =
+          reinterpret_cast<const uint4*>(weight_row)[vector_index];
+      x_pack.vector =
+          reinterpret_cast<const uint4*>(x)[vector_index];
+#pragma unroll
+      for (int pair_index = 0; pair_index < 4; ++pair_index) {
+        const float2 weight_value =
+            __half22float2(weight_pack.pairs[pair_index]);
+        const float2 x_value =
+            __half22float2(x_pack.pairs[pair_index]);
+        projection_streams[pair_index] = fmaf(
+            x_value.x,
+            weight_value.x,
+            projection_streams[pair_index]);
+        projection_streams[pair_index] = fmaf(
+            x_value.y,
+            weight_value.y,
+            projection_streams[pair_index]);
+        square_streams[pair_index] = fmaf(
+            x_value.x, x_value.x, square_streams[pair_index]);
+        square_streams[pair_index] = fmaf(
+            x_value.y, x_value.y, square_streams[pair_index]);
+      }
+    }
+    projection =
+        projection_streams[0] + projection_streams[1] +
+        projection_streams[2] + projection_streams[3];
+    square_sum =
+        square_streams[0] + square_streams[1] +
+        square_streams[2] + square_streams[3];
+  } else if ((hidden_dim & 1) == 0) {
+    const int pair_count = hidden_dim / 2;
+    for (int pair_index = lane; pair_index < pair_count; pair_index += 32) {
+      const float2 weight_value = __half22float2(
+          reinterpret_cast<const half2*>(weight_row)[pair_index]);
+      const float2 x_value = __half22float2(
+          reinterpret_cast<const half2*>(x)[pair_index]);
+      projection = fmaf(x_value.x, weight_value.x, projection);
+      projection = fmaf(x_value.y, weight_value.y, projection);
+      square_sum = fmaf(x_value.x, x_value.x, square_sum);
+      square_sum = fmaf(x_value.y, x_value.y, square_sum);
+    }
+  } else {
+    for (int k_index = lane; k_index < hidden_dim; k_index += 32) {
+      const float x_value = __half2float(x[k_index]);
+      projection = fmaf(
+          x_value, __half2float(weight_row[k_index]), projection);
+      square_sum = fmaf(x_value, x_value, square_sum);
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    projection += __shfl_down_sync(0xffffffff, projection, offset);
+    square_sum += __shfl_down_sync(0xffffffff, square_sum, offset);
+  }
+  if (lane == 0) {
+    float value = projection * rsqrtf(
+        square_sum / static_cast<float>(hidden_dim) + eps);
+    if (bias != nullptr) value += __half2float(bias[output_index]);
+    output[output_index] = __float2half(value);
+  }
+}
+
 }  // namespace nonlinear
 
 void launch_fused_rmsnorm_projection_fp16(
@@ -205,4 +341,21 @@ void launch_rms_scale_bias_fp16(
   const dim3 grid((total_elements + kScaleThreads - 1) / kScaleThreads);
   nonlinear::rms_scale_bias_kernel<<<grid, block, 0, stream>>>(
       output, square_sum, bias, total_elements, out_dim, hidden_dim, eps);
+}
+
+void launch_fused_rmsnorm_direct_fp16(
+    const half* x,
+    const half* weight,
+    const half* bias,
+    half* output,
+    int out_dim,
+    int hidden_dim,
+    float eps,
+    cudaStream_t stream) {
+  const dim3 block(nonlinear::kDirectThreads);
+  const dim3 grid(
+      (out_dim + nonlinear::kDirectWarps - 1) /
+      nonlinear::kDirectWarps);
+  nonlinear::fused_rmsnorm_direct_kernel<<<grid, block, 0, stream>>>(
+      x, weight, bias, output, out_dim, hidden_dim, eps);
 }
