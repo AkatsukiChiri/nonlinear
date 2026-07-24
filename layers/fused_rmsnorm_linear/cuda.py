@@ -35,6 +35,18 @@ def _load_extension() -> ModuleType:
                 / "fused_rmsnorm_linear"
                 / "fused_rmsnorm_linear.cu"
             ),
+            str(
+                root
+                / "kernels"
+                / "fused_rmsnorm_linear"
+                / "fused_add_rms_linear.cpp"
+            ),
+            str(
+                root
+                / "kernels"
+                / "fused_rmsnorm_linear"
+                / "fused_add_rms_linear.cu"
+            ),
         ],
         extra_cflags=["-O3", "-std=c++17"],
         extra_cuda_cflags=[
@@ -79,3 +91,41 @@ def fused_rmsnorm_linear_bias_fp16(
         bias,
         eps,
     )
+
+
+def fused_add_rms_linear_fp16(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    fused_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused residual add, RMSNorm, and Linear without bias."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
+        raise RuntimeError("fused_add_rms_linear_fp16 requires an Ampere GPU")
+    output, residual_sum = _load_extension().fused_add_rms_linear_fp16(
+        x,
+        x_res,
+        fused_weight,
+        eps,
+    )
+    return output, residual_sum
+
+
+def fused_add_rms_linear_bias_fp16(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    fused_weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused residual add, RMSNorm, and Linear with bias."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
+        raise RuntimeError("fused_add_rms_linear_bias_fp16 requires an Ampere GPU")
+    output, residual_sum = _load_extension().fused_add_rms_linear_bias_fp16(
+        x,
+        x_res,
+        fused_weight,
+        bias,
+        eps,
+    )
+    return output, residual_sum

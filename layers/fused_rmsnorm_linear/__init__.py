@@ -6,6 +6,8 @@ import torch
 from torch import nn
 
 from .cuda import (
+    fused_add_rms_linear_bias_fp16,
+    fused_add_rms_linear_fp16,
     fused_rmsnorm_linear_bias_fp16,
     fused_rmsnorm_linear_fp16,
 )
@@ -107,3 +109,61 @@ class FusedRMSNormLinear(nn.Module):
                 self.eps,
             )
         return fused_rmsnorm_linear_fp16(x, self.fused_weight, self.eps)
+
+
+class FusedAddRMSNormLinear(FusedRMSNormLinear):
+    """Fuse residual add, frozen RMSNorm, and Linear for decode inference.
+
+    The forward pass returns both the Linear projection and the FP16 residual
+    sum so the latter can be reused by the next decoder layer without launching
+    a separate add kernel.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_res: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply fused residual add, RMSNorm, and Linear.
+
+        Args:
+            x: Contiguous FP16 tensor shaped [Batch, 1, HiddenDim].
+            x_res: Contiguous FP16 residual with the same shape as ``x``.
+
+        Returns:
+            ``(linear_output, residual_sum)`` where the tensors have shapes
+            [Batch, 1, OutDim] and [Batch, 1, HiddenDim], respectively.
+        """
+        if x.shape != x_res.shape:
+            raise ValueError(
+                "x and x_res must have the same shape, got "
+                f"{tuple(x.shape)} and {tuple(x_res.shape)}"
+            )
+        if x.ndim != 3 or x.shape[1] != 1 or x.shape[2] != self.hidden_dim:
+            raise ValueError(
+                "x must have shape [Batch, 1, HiddenDim], got "
+                f"{tuple(x.shape)} with expected HiddenDim={self.hidden_dim}"
+            )
+        if x.device != x_res.device:
+            raise ValueError("x and x_res must be on the same device")
+        if x.dtype != x_res.dtype:
+            raise TypeError("x and x_res must have the same dtype")
+        if x.device != self.fused_weight.device:
+            raise ValueError("inputs and fused_weight must be on the same device")
+        if x.dtype != self.fused_weight.dtype:
+            raise TypeError("inputs and fused_weight must have the same dtype")
+
+        if self.bias is not None:
+            return fused_add_rms_linear_bias_fp16(
+                x,
+                x_res,
+                self.fused_weight,
+                self.bias,
+                self.eps,
+            )
+        return fused_add_rms_linear_fp16(
+            x,
+            x_res,
+            self.fused_weight,
+            self.eps,
+        )

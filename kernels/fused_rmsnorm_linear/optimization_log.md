@@ -436,3 +436,99 @@ Batch=1 speedup:     2.597x
 
 Batch=2 从基线 `0.0753 ms` 降至最终 `0.0652 ms`，绝对延迟改善约
 13.4%。未达到 3x，但已触发本阶段连续三轮不足 3% 的停止限制。
+
+# Fused Add + RMSNorm + Linear：Batch=1 优化阶段
+
+本阶段使用
+`benchmark/fused_rmsnorm_linear/bench_fused_add_rms_linear.py --batch 1
+--iterations 100`。停止规则为：以三次修改窗口起点的最佳延迟为基准，三次修改
+完成后的累计提升不足 5% 时停止，并恢复窗口内最佳版本。
+
+## 基线
+
+```text
+Correctness max abs error: 0.000976562
+Fused mean:               0.0717 ms
+Fused p50:                0.0695 ms
+PyTorch mean:             0.1805 ms
+Speedup:                  2.518x
+```
+
+当前 Batch=1 使用 32 warps/CTA。每个输出 warp 同时计算 projection 和
+`sum((x + x_res)^2)`，并由 block 0 的 warp 0 写回 FP16 residual。
+
+## 第 1 轮：16 warps/CTA
+
+修改思路：
+
+- 将 Batch=1 从 32 warps/CTA 改成 16 warps/CTA。
+- 尝试允许每个 SM 同时驻留两个 CTA，并减小最后一波 CTA 不均衡。
+
+结果：
+
+```text
+Fused mean:   0.0770 ms
+Fused p50:    0.0755 ms
+PyTorch mean: 0.1825 ms
+Speedup:      2.370x
+```
+
+相对基线退化约 7.4%。说明增加 CTA 数量和重复输入工作造成的代价大于驻留率收益。
+
+## 第 2 轮：CTA 共享 inverse RMS
+
+修改思路：
+
+- 恢复 32 warps/CTA。
+- 每个 CTA 仅由 warp 0 计算一次 residual平方和。
+- 通过 shared memory向该CTA的32个 projection warp广播 inverse RMS。
+- projection warp不再维护平方和累加流。
+
+结果：
+
+```text
+Fused mean:   0.0750 ms
+Fused p50:    0.0727 ms
+PyTorch mean: 0.1772 ms
+Speedup:      2.361x
+```
+
+相对基线退化约 4.6%。CTA同步等待和 projection累加链的 ILP下降抵消了减少平方
+计算的收益。
+
+## 第 3 轮：CTA 共享 FP16 residual
+
+修改思路：
+
+- 在第2轮基础上，由 warp 0将 `x + x_res` 写入动态 shared memory。
+- projection warp复用 shared residual，避免重复读取两个输入并执行 FP16 add。
+- block 0 同时将同一 residual写回最终输出张量。
+
+结果：
+
+```text
+Fused mean:   0.0782 ms
+Fused p50:    0.0735 ms
+PyTorch mean: 0.1815 ms
+Speedup:      2.321x
+```
+
+相对基线退化约 9.1%。shared memory阶段和 CTA barrier进一步延长了权重流式读取
+开始前的等待。
+
+## 停止结论
+
+三次修改完成后，相对窗口起点 `0.0717 ms` 的累计提升为 0%，不足 5%，触发停止
+规则。最终恢复原始 32 warps/CTA 单 kernel版本。该窗口未达到 3x目标，最佳实测
+仍为基线的 2.518x。
+
+恢复最佳版本后的最终复测：
+
+```text
+Correctness:               10 passed
+Correctness max abs error: 0.000976562
+Fused mean:                0.0721 ms
+Fused p50:                 0.0696 ms
+PyTorch mean:              0.1811 ms
+Speedup:                   2.511x
+```

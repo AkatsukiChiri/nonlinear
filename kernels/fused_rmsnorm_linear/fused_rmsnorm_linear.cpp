@@ -6,6 +6,21 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
+#include <vector>
+
+std::vector<torch::Tensor> fused_add_rms_linear_fp16(
+    torch::Tensor x,
+    torch::Tensor x_res,
+    torch::Tensor fused_weight,
+    double eps);
+
+std::vector<torch::Tensor> fused_add_rms_linear_bias_fp16(
+    torch::Tensor x,
+    torch::Tensor x_res,
+    torch::Tensor fused_weight,
+    torch::Tensor bias,
+    double eps);
+
 void launch_fused_rmsnorm_projection_fp16(
     const half* x,
     const half* weight,
@@ -237,4 +252,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "fused_rmsnorm_linear_bias_fp16",
       &fused_rmsnorm_linear_bias_fp16,
       "Small-batch fused RMSNorm and biased Linear FP16 kernel");
+  module.def(
+      "fused_add_rms_linear_fp16",
+      &fused_add_rms_linear_fp16,
+      "Fused residual add, RMSNorm, and Linear FP16 kernel");
+  module.def(
+      "fused_add_rms_linear_bias_fp16",
+      &fused_add_rms_linear_bias_fp16,
+      "Fused residual add, RMSNorm, and biased Linear FP16 kernel");
 }

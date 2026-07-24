@@ -64,6 +64,47 @@ def rmsnorm_linear_ref(
     return torch.matmul(x_norm, linear_weight.t())
 
 
+def add_rmsnorm_linear_ref(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    rmsnorm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    linear_bias: torch.Tensor | None = None,
+    eps: float = DEFAULT_EPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply FP16 residual add, RMSNorm, and Linear.
+
+    Args:
+        x: Decode hidden states shaped [Batch, 1, HiddenDim].
+        x_res: Residual states with the same shape, dtype, and device as ``x``.
+        rmsnorm_weight: RMSNorm scale shaped [HiddenDim].
+        linear_weight: Linear weight shaped [OutDim, HiddenDim].
+        linear_bias: Optional Linear bias shaped [OutDim].
+        eps: Small value added to the RMS variance.
+
+    Returns:
+        A tuple containing projected states shaped [Batch, 1, OutDim] and the
+        FP16 residual sum shaped [Batch, 1, HiddenDim].
+    """
+    if x.shape != x_res.shape:
+        raise ValueError(
+            f"x and x_res must have the same shape, got {x.shape} and {x_res.shape}"
+        )
+    if x.dtype != x_res.dtype or x.device != x_res.device:
+        raise ValueError("x and x_res must have the same dtype and device")
+
+    residual_sum = x + x_res
+    output = rmsnorm_linear_ref(
+        residual_sum,
+        rmsnorm_weight,
+        linear_weight,
+        eps,
+    )
+    if linear_bias is not None:
+        output = output + linear_bias
+    return output, residual_sum
+
+
 def build_llama3_8b_qkv_decode_inputs(
     *,
     batch: int = DEFAULT_BATCH,
