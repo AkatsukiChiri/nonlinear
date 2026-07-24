@@ -45,6 +45,16 @@ void launch_fused_rmsnorm_direct_fp16(
     float eps,
     cudaStream_t stream);
 
+void launch_fused_rmsnorm_direct_batch2_fp16(
+    const half* x,
+    const half* weight,
+    const half* bias,
+    half* output,
+    int out_dim,
+    int hidden_dim,
+    float eps,
+    cudaStream_t stream);
+
 torch::Tensor fused_rmsnorm_linear_fp16(
     torch::Tensor x,
     torch::Tensor fused_weight,
@@ -78,6 +88,19 @@ torch::Tensor fused_rmsnorm_linear_fp16(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (batch == 1) {
     launch_fused_rmsnorm_direct_fp16(
+        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
+        nullptr,
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        out_dim,
+        hidden_dim,
+        static_cast<float>(eps),
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+  }
+  if (batch == 2) {
+    launch_fused_rmsnorm_direct_batch2_fp16(
         reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
         nullptr,
@@ -154,6 +177,19 @@ torch::Tensor fused_rmsnorm_linear_bias_fp16(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (batch == 1) {
     launch_fused_rmsnorm_direct_fp16(
+        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        out_dim,
+        hidden_dim,
+        static_cast<float>(eps),
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+  }
+  if (batch == 2) {
+    launch_fused_rmsnorm_direct_batch2_fp16(
         reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),

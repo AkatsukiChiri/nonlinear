@@ -323,3 +323,116 @@ Speedup:     2.572x
 
 不同运行之间存在小幅时钟与调度波动；第 8 轮记录到的最低 mean 为
 `0.0648 ms`，恢复后 p50 仍为 `0.0645 ms`。
+
+# Batch=2 优化阶段
+
+Batch=2 使用新的独立计数，连续三轮提升不足 3% 时停止。Batch=1 direct
+kernel 保持不变。
+
+## Batch=2 基线
+
+```text
+Correctness: 10 passed
+Fused:       0.0753 ms
+PyTorch:     0.1782 ms
+Speedup:     2.366x
+```
+
+## Batch=2 第 1 轮：专用单 kernel
+
+修改思路：
+
+- 每个 warp 一次读取 FP16 权重，同时计算两个 batch 的 projection。
+- 每个 warp 同时计算两份 RMS 统计并直接缩放输出。
+- 删除 Batch=2 的 `square_sum` 临时张量和第二次 epilogue launch。
+- 使用 128-bit FP16 load、四路 projection 和四路 square-sum FP32 累加。
+
+正确性与性能：
+
+```text
+Correctness: 10 passed
+Fused:       0.0654 ms
+PyTorch:     0.1701 ms
+Speedup:     2.602x
+```
+
+结论：相对 Batch=2 基线提升约 13.1%，超过 3%，成为 Batch=2 新最佳版本。
+
+## Batch=2 第 2 轮：CTA 共享 RMS 统计
+
+修改思路：
+
+- 保留 32 个输出 warp。
+- 仅 warp 0 计算两个 batch 的 RMS 统计。
+- CTA 同步后共享两份 inverse RMS。
+
+正确性与性能：
+
+```text
+Correctness: 10 passed
+Fused:       0.0662 ms
+PyTorch:     0.1700 ms
+Speedup:     2.567x
+```
+
+结论：慢于第 1 轮最佳，提升不足 3%。连续不足 3% 的轮数为 1。
+
+## Batch=2 第 3 轮：跨 batch half2
+
+修改思路：
+
+- 将两个 batch 的同一 K 位置打包到 `half2`。
+- 一个 FP16 权重标量广播到两个 half lane。
+- 每 8 个 K 元素将 FP16 短累加结果转换回 FP32。
+
+正确性与性能：
+
+```text
+Correctness: 10 passed
+Fused:       0.0665 ms
+PyTorch:     0.1690 ms
+Speedup:     2.542x
+```
+
+结论：慢于第 1 轮最佳，提升不足 3%。连续不足 3% 的轮数为 2。
+
+## Batch=2 第 4 轮：专用 16 warps/CTA
+
+修改思路：
+
+- 恢复第 1 轮的 FP32 projection 与 square-sum 累加。
+- Batch=2 单独使用 16 warps/CTA，尝试通过两个 CTA/SM 改善高寄存器模板
+  的 occupancy。
+- Batch=1 的 32 warps/CTA 路径不变。
+
+正确性与性能：
+
+```text
+Correctness: 10 passed
+Fused:       0.0663 ms
+PyTorch:     0.1705 ms
+Speedup:     2.573x
+```
+
+结论：
+
+- 慢于第 1 轮最佳，提升不足 3%。
+- 第 2、3、4 轮连续三轮提升不足 3%，触发 Batch=2 停止条件。
+- 最终恢复 Batch=2 第 1 轮的 32 warps/CTA 专用单 kernel。
+
+恢复最佳版本后的最终复测：
+
+```text
+Batch=2 correctness: 10 passed
+Batch=2 fused mean:  0.0652 ms
+Batch=2 fused p50:   0.0646 ms
+Batch=2 PyTorch:     0.1704 ms
+Batch=2 speedup:     2.614x
+
+Batch=1 fused mean:  0.0652 ms
+Batch=1 fused p50:   0.0645 ms
+Batch=1 speedup:     2.597x
+```
+
+Batch=2 从基线 `0.0753 ms` 降至最终 `0.0652 ms`，绝对延迟改善约
+13.4%。未达到 3x，但已触发本阶段连续三轮不足 3% 的停止限制。

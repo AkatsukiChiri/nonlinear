@@ -7,6 +7,8 @@ constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kDirectWarps = 32;
 constexpr int kDirectThreads = kDirectWarps * 32;
+constexpr int kBatch2DirectWarps = 32;
+constexpr int kBatch2DirectThreads = kBatch2DirectWarps * 32;
 
 union Half8Pack {
   uint4 vector;
@@ -280,6 +282,117 @@ void fused_rmsnorm_direct_kernel(
   }
 }
 
+__global__ __launch_bounds__(kBatch2DirectThreads)
+void fused_rmsnorm_direct_batch2_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    const half* __restrict__ bias,
+    half* __restrict__ output,
+    int out_dim,
+    int hidden_dim,
+    float eps) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int output_index = blockIdx.x * kBatch2DirectWarps + warp;
+  if (output_index >= out_dim) return;
+
+  float projection[2] = {};
+  float square_sum[2] = {};
+  const half* weight_row = weight + output_index * hidden_dim;
+  if ((hidden_dim & 7) == 0) {
+    float projection_streams[4][2] = {};
+    float square_streams[4][2] = {};
+    const int vector_count = hidden_dim / 8;
+    for (int vector_index = lane; vector_index < vector_count;
+         vector_index += 32) {
+      Half8Pack weight_pack;
+      Half8Pack x_pack[2];
+      weight_pack.vector =
+          reinterpret_cast<const uint4*>(weight_row)[vector_index];
+#pragma unroll
+      for (int batch_index = 0; batch_index < 2; ++batch_index) {
+        x_pack[batch_index].vector =
+            reinterpret_cast<const uint4*>(
+                x + batch_index * hidden_dim)[vector_index];
+      }
+#pragma unroll
+      for (int pair_index = 0; pair_index < 4; ++pair_index) {
+        const float2 weight_value =
+            __half22float2(weight_pack.pairs[pair_index]);
+#pragma unroll
+        for (int batch_index = 0; batch_index < 2; ++batch_index) {
+          const float2 x_value =
+              __half22float2(x_pack[batch_index].pairs[pair_index]);
+          projection_streams[pair_index][batch_index] = fmaf(
+              x_value.x,
+              weight_value.x,
+              projection_streams[pair_index][batch_index]);
+          projection_streams[pair_index][batch_index] = fmaf(
+              x_value.y,
+              weight_value.y,
+              projection_streams[pair_index][batch_index]);
+          square_streams[pair_index][batch_index] = fmaf(
+              x_value.x,
+              x_value.x,
+              square_streams[pair_index][batch_index]);
+          square_streams[pair_index][batch_index] = fmaf(
+              x_value.y,
+              x_value.y,
+              square_streams[pair_index][batch_index]);
+        }
+      }
+    }
+#pragma unroll
+    for (int batch_index = 0; batch_index < 2; ++batch_index) {
+      projection[batch_index] =
+          projection_streams[0][batch_index] +
+          projection_streams[1][batch_index] +
+          projection_streams[2][batch_index] +
+          projection_streams[3][batch_index];
+      square_sum[batch_index] =
+          square_streams[0][batch_index] +
+          square_streams[1][batch_index] +
+          square_streams[2][batch_index] +
+          square_streams[3][batch_index];
+    }
+  } else {
+    for (int k_index = lane; k_index < hidden_dim; k_index += 32) {
+      const float weight_value = __half2float(weight_row[k_index]);
+#pragma unroll
+      for (int batch_index = 0; batch_index < 2; ++batch_index) {
+        const float x_value =
+            __half2float(x[batch_index * hidden_dim + k_index]);
+        projection[batch_index] = fmaf(
+            x_value, weight_value, projection[batch_index]);
+        square_sum[batch_index] = fmaf(
+            x_value, x_value, square_sum[batch_index]);
+      }
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int batch_index = 0; batch_index < 2; ++batch_index) {
+      projection[batch_index] += __shfl_down_sync(
+          0xffffffff, projection[batch_index], offset);
+      square_sum[batch_index] += __shfl_down_sync(
+          0xffffffff, square_sum[batch_index], offset);
+    }
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int batch_index = 0; batch_index < 2; ++batch_index) {
+      float value = projection[batch_index] * rsqrtf(
+          square_sum[batch_index] /
+              static_cast<float>(hidden_dim) +
+          eps);
+      if (bias != nullptr) value += __half2float(bias[output_index]);
+      output[batch_index * out_dim + output_index] =
+          __float2half(value);
+    }
+  }
+}
+
 }  // namespace nonlinear
 
 void launch_fused_rmsnorm_projection_fp16(
@@ -357,5 +470,22 @@ void launch_fused_rmsnorm_direct_fp16(
       (out_dim + nonlinear::kDirectWarps - 1) /
       nonlinear::kDirectWarps);
   nonlinear::fused_rmsnorm_direct_kernel<<<grid, block, 0, stream>>>(
+      x, weight, bias, output, out_dim, hidden_dim, eps);
+}
+
+void launch_fused_rmsnorm_direct_batch2_fp16(
+    const half* x,
+    const half* weight,
+    const half* bias,
+    half* output,
+    int out_dim,
+    int hidden_dim,
+    float eps,
+    cudaStream_t stream) {
+  const dim3 block(nonlinear::kBatch2DirectThreads);
+  const dim3 grid(
+      (out_dim + nonlinear::kBatch2DirectWarps - 1) /
+      nonlinear::kBatch2DirectWarps);
+  nonlinear::fused_rmsnorm_direct_batch2_kernel<<<grid, block, 0, stream>>>(
       x, weight, bias, output, out_dim, hidden_dim, eps);
 }
