@@ -532,3 +532,71 @@ Fused p50:                 0.0696 ms
 PyTorch mean:              0.1811 ms
 Speedup:                   2.511x
 ```
+
+# Fused Add Batch=1：激进优化重置窗口
+
+用户重置停止计数后，以相同默认形状和 200 次迭代重新建立窗口。
+
+## 新基线
+
+```text
+Fused mean:   0.0703 ms
+Fused p50:    0.0694 ms
+PyTorch mean: 0.1807 ms
+Speedup:      2.571x
+```
+
+## 第 1 轮：packed FP16乘积、FP32累加
+
+使用 CUDA Core `half2` 同时计算两个 projection乘积和平方，再将乘积转换成
+FP32累加，减少循环中的 FP16解包和标量FMA指令。
+
+首次结果为 `0.0700 ms`，但最终重复复测为：
+
+```text
+Fused mean:   0.0714 ms
+Fused p50:    0.0707 ms
+PyTorch mean: 0.1815 ms
+Speedup:      2.542x
+```
+
+正确性通过，最大绝对误差 `0.000976562`。重复结果表明首次小幅改善属于测量
+波动，因此未保留。
+
+## 第 2 轮：局部 half2 FMA累加
+
+每个 lane的短局部点积先以 `half2 FMA` 累加，warp归约前再转换成 FP32，进一步
+减少转换指令。
+
+```text
+Correctness:  10 passed
+Max abs error: 0.00195312
+Fused mean:   0.0708 ms
+Fused p50:    0.0695 ms
+PyTorch mean: 0.1799 ms
+Speedup:      2.543x
+```
+
+性能未改善且误差扩大到 `0.00195312`，未保留。
+
+## 第 3 轮：Batch=1专用两阶段路径
+
+第一 kernel只计算并写回 FP16 residual和 inverse RMS；第二 kernel执行不含平方和
+的纯 projection。目标是彻底删除每个输出 warp重复的 add和平方计算。
+
+```text
+Correctness:  10 passed
+Max abs error: 0.000976562
+Fused mean:   0.0786 ms
+Fused p50:    0.0777 ms
+PyTorch mean: 0.1801 ms
+Speedup:      2.291x
+```
+
+额外 launch和4字节临时张量分配的代价超过删除冗余计算的收益。
+
+## 本窗口结论
+
+三次修改相对新基线的累计稳定提升不足 5%，再次触发停止条件。最终恢复新基线的
+32 warps/CTA、单 kernel、FP32 FMA实现。恢复后的验证为 `10 passed`，均值
+`0.0710 ms`、p50 `0.0695 ms`；未达到 3x目标。
