@@ -42,8 +42,14 @@ y = \frac{z(\gamma W)^\mathsf{T}}
 - `blockIdx.x == 0 && warp == 0` 负责将 residual 写回一次；其他 warp
   只在寄存器中生成 add 结果，避免多个 warp 重复写同一地址。
 - HiddenDim 是 8 的倍数时使用 128-bit load，并以四条独立累加流减少依赖链。
-- Batch=1、2 使用 32 warps/CTA；Batch=3～8 使用编译期 Batch
-  模板和 8 warps/CTA。
+- Batch=1、2 使用 32 warps/CTA 的单 kernel direct 路径。
+- Batch=4 使用两阶段专用路径：第一个 kernel 复用一次权重读取完成所有
+  batch projection，仅首个 CTA 计算 residual 和 RMS统计；第二个 kernel
+  完成缩放。
+- Batch=8 直接复用原 `fused_rmsnorm_linear` 的高性能模板：先用128-bit
+  residual-add kernel物化 FP16 sum，再执行原B8 projection/statistics和
+  scale。这样避免B8 direct模板的144寄存器压力。
+- 其他 Batch 使用编译期 Batch模板和8 warps/CTA。
 - 同一个输出 warp 加载一次权重元素，并在寄存器中复用于该 warp负责的所有 batch。
 
 ## 测试和 benchmark

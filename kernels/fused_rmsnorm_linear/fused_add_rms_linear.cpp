@@ -21,6 +21,54 @@ void launch_fused_add_rms_linear_fp16(
     float eps,
     cudaStream_t stream);
 
+void launch_residual_add_fp16(
+    const half* x,
+    const half* x_res,
+    half* residual_sum,
+    int total_elements,
+    cudaStream_t stream);
+
+void launch_fused_rmsnorm_projection_fp16(
+    const half* x,
+    const half* weight,
+    half* output,
+    float* square_sum,
+    int batch,
+    int out_dim,
+    int hidden_dim,
+    cudaStream_t stream);
+
+void launch_fused_add_rms_projection_fp16(
+    const half* x,
+    const half* x_res,
+    const half* weight,
+    half* output,
+    half* residual_sum,
+    float* square_sum,
+    int batch,
+    int out_dim,
+    int hidden_dim,
+    cudaStream_t stream);
+
+void launch_rms_scale_fp16(
+    half* output,
+    const float* square_sum,
+    int batch,
+    int out_dim,
+    int hidden_dim,
+    float eps,
+    cudaStream_t stream);
+
+void launch_rms_scale_bias_fp16(
+    half* output,
+    const float* square_sum,
+    const half* bias,
+    int batch,
+    int out_dim,
+    int hidden_dim,
+    float eps,
+    cudaStream_t stream);
+
 namespace {
 
 void validate_inputs(
@@ -90,6 +138,91 @@ std::vector<torch::Tensor> run_fused_add_rms_linear(
   auto output = torch::empty({batch, 1, out_dim}, x.options());
   auto residual_sum = torch::empty_like(x);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (batch == 8) {
+    auto square_sum = torch::empty(
+        {batch},
+        x.options().dtype(torch::kFloat32));
+    launch_residual_add_fp16(
+        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(x_res.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(residual_sum.data_ptr<at::Half>()),
+        batch * hidden_dim,
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    launch_fused_rmsnorm_projection_fp16(
+        reinterpret_cast<const half*>(residual_sum.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        square_sum.data_ptr<float>(),
+        batch,
+        out_dim,
+        hidden_dim,
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (bias == nullptr) {
+      launch_rms_scale_fp16(
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+          square_sum.data_ptr<float>(),
+          batch,
+          out_dim,
+          hidden_dim,
+          static_cast<float>(eps),
+          stream);
+    } else {
+      launch_rms_scale_bias_fp16(
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+          square_sum.data_ptr<float>(),
+          reinterpret_cast<const half*>(bias->data_ptr<at::Half>()),
+          batch,
+          out_dim,
+          hidden_dim,
+          static_cast<float>(eps),
+          stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, residual_sum};
+  }
+
+  if (batch == 4) {
+    auto square_sum = torch::empty(
+        {batch},
+        x.options().dtype(torch::kFloat32));
+    launch_fused_add_rms_projection_fp16(
+        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(x_res.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(fused_weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(residual_sum.data_ptr<at::Half>()),
+        square_sum.data_ptr<float>(),
+        batch,
+        out_dim,
+        hidden_dim,
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (bias == nullptr) {
+      launch_rms_scale_fp16(
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+          square_sum.data_ptr<float>(),
+          batch,
+          out_dim,
+          hidden_dim,
+          static_cast<float>(eps),
+          stream);
+    } else {
+      launch_rms_scale_bias_fp16(
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+          square_sum.data_ptr<float>(),
+          reinterpret_cast<const half*>(bias->data_ptr<at::Half>()),
+          batch,
+          out_dim,
+          hidden_dim,
+          static_cast<float>(eps),
+          stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, residual_sum};
+  }
 
   launch_fused_add_rms_linear_fp16(
       reinterpret_cast<const half*>(x.data_ptr<at::Half>()),

@@ -600,3 +600,60 @@ Speedup:      2.291x
 三次修改相对新基线的累计稳定提升不足 5%，再次触发停止条件。最终恢复新基线的
 32 warps/CTA、单 kernel、FP32 FMA实现。恢复后的验证为 `10 passed`，均值
 `0.0710 ms`、p50 `0.0695 ms`；未达到 3x目标。
+
+# Fused Add：Batch=2/4/8 分路径优化
+
+默认形状均为 `K=N=4096`、FP16、RTX 3090，每组200次计时。
+
+## 优化前基线
+
+```text
+Batch 2: 0.0716 ms，Add + Fused RMS 0.0764 ms
+Batch 4: 0.0917 ms，Add + Fused RMS 0.0810 ms
+Batch 8: 0.1330 ms，Add + Fused RMS 0.1000 ms
+```
+
+原direct模板的寄存器数据：
+
+```text
+Batch 4:  75 registers/thread
+Batch 8: 144 registers/thread
+```
+
+B8同时保存四路projection和四路平方和的8个batch累加器，导致occupancy过低。
+
+## Batch 4：projection/statistics + scale
+
+采用与原 `fused_rmsnorm_linear` B4模板相同的两阶段结构：
+
+- 权重只读取一次并跨4个batch复用。
+- 仅block 0计算FP16 residual和平方和。
+- projection warp不再保存平方和累加流。
+- 第二个轻量kernel完成inverse RMS缩放。
+
+结果约为 `0.079～0.081 ms`，相对原0.0917 ms提升约11%～14%，并达到或略快于
+外部add加fused-rms路径。
+
+## Batch 8：128-bit add + 原B8 fused-rms模板
+
+实验表明在projection warp内即时add无法同时满足低寄存器与低指令数：
+
+- 去掉重复平方和后约 `0.1237 ms`。
+- 两路累加降至64寄存器后约 `0.1120 ms`。
+- pair级half2流式load虽降寄存器，但退化到 `0.1826 ms`。
+- 先add+inverse RMS再直接projection约 `0.1093 ms`，前置单CTA统计无法与
+  projection重叠。
+
+最终采用B8专用三阶段：
+
+1. 128-bit FP16 residual add。
+2. 直接调用原B8 `fused_rmsnorm_linear` projection/statistics模板。
+3. scale kernel。
+
+最终约 `0.099～0.100 ms`，相对原0.1330 ms提升约25%，与外部
+`Add + FusedRMSNormLinear`持平或略快，同时保留单一融合层接口和内部buffer管理。
+
+## Batch 2
+
+B2继续使用32 warps/CTA direct单kernel，约 `0.072 ms`，稳定快于外部add加
+fused-rms路径，未作结构性修改。

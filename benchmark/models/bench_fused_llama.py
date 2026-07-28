@@ -18,6 +18,9 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from models.fused_llama import convert_llama_to_fused_rmsnorm_linear
+from models.fused_add_llama import (
+    convert_llama_to_fused_add_rmsnorm_linear,
+)
 
 
 DEFAULT_MODEL_PATH = "/home/mashaobo/models/llama3-8b/"
@@ -265,52 +268,115 @@ def main() -> None:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-        fused_model = _load_model(
+        fused_rms_model = _load_model(
             str(model_path),
             device,
             args.attention_implementation,
         )
-        fused_cache = _prefill_static_cache(fused_model, prompt)
-        report = convert_llama_to_fused_rmsnorm_linear(fused_model)
-        fused_decode = _build_decode_function(
-            fused_model,
-            fused_cache,
+        fused_rms_cache = _prefill_static_cache(fused_rms_model, prompt)
+        fused_rms_report = convert_llama_to_fused_rmsnorm_linear(
+            fused_rms_model
+        )
+        fused_rms_decode = _build_decode_function(
+            fused_rms_model,
+            fused_rms_cache,
             next_token,
             args.prompt_length,
         )
         torch.cuda.reset_peak_memory_stats(device)
-        fused_output, fused_timing = _measure(
-            fused_decode,
+        fused_rms_output, fused_rms_timing = _measure(
+            fused_rms_decode,
             args.warmup,
             args.iterations,
-            "Fused Llama",
+            "Fused RMS Llama",
         )
-        fused_peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
-        fused_logits = fused_output.float().cpu()
+        fused_rms_peak_gib = (
+            torch.cuda.max_memory_allocated(device) / 2**30
+        )
+        fused_rms_logits = fused_rms_output.float().cpu()
 
-    absolute_error = (fused_logits - reference_logits).abs()
-    max_absolute_error = absolute_error.max().item()
-    mean_absolute_error = absolute_error.mean().item()
+        del (
+            fused_rms_decode,
+            fused_rms_output,
+            fused_rms_cache,
+            fused_rms_model,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        fused_add_model = _load_model(
+            str(model_path),
+            device,
+            args.attention_implementation,
+        )
+        fused_add_cache = _prefill_static_cache(fused_add_model, prompt)
+        fused_add_report = convert_llama_to_fused_add_rmsnorm_linear(
+            fused_add_model
+        )
+        fused_add_decode = _build_decode_function(
+            fused_add_model,
+            fused_add_cache,
+            next_token,
+            args.prompt_length,
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+        fused_add_output, fused_add_timing = _measure(
+            fused_add_decode,
+            args.warmup,
+            args.iterations,
+            "Fused Add Llama",
+        )
+        fused_add_peak_gib = (
+            torch.cuda.max_memory_allocated(device) / 2**30
+        )
+        fused_add_logits = fused_add_output.float().cpu()
+
+    fused_rms_error = (fused_rms_logits - reference_logits).abs()
+    fused_add_error = (fused_add_logits - reference_logits).abs()
     native_top1 = reference_logits.argmax(dim=-1)
-    fused_top1 = fused_logits.argmax(dim=-1)
+    fused_rms_top1 = fused_rms_logits.argmax(dim=-1)
+    fused_add_top1 = fused_add_logits.argmax(dim=-1)
 
     print(
-        f"converted decoder layers={report.decoder_layers}, "
-        f"fused projections={report.fused_projections}"
+        f"fused-rms conversion: layers={fused_rms_report.decoder_layers}, "
+        f"projections={fused_rms_report.fused_projections}"
+    )
+    print(
+        f"fused-add conversion: layers={fused_add_report.decoder_layers}, "
+        f"add projections={fused_add_report.fused_add_projections}, "
+        f"rms projections={fused_add_report.fused_rms_projections}"
     )
     _print_timing("Transformers Llama", native_timing, args.batch)
-    _print_timing("Fused Llama", fused_timing, args.batch)
+    _print_timing("Fused RMS Llama", fused_rms_timing, args.batch)
+    _print_timing("Fused Add Llama", fused_add_timing, args.batch)
     print(
-        f"speedup: {native_timing.mean_ms / fused_timing.mean_ms:.3f}x"
+        "fused-rms speedup: "
+        f"{native_timing.mean_ms / fused_rms_timing.mean_ms:.3f}x"
     )
     print(
-        f"logits max_abs_error={max_absolute_error:.6g}, "
-        f"mean_abs_error={mean_absolute_error:.6g}, "
-        f"top1_match={torch.equal(native_top1, fused_top1)}"
+        "fused-add speedup: "
+        f"{native_timing.mean_ms / fused_add_timing.mean_ms:.3f}x"
     )
     print(
-        f"peak allocated memory: native={native_peak_gib:.3f} GiB, "
-        f"fused={fused_peak_gib:.3f} GiB"
+        "fused-add vs fused-rms: "
+        f"{fused_rms_timing.mean_ms / fused_add_timing.mean_ms:.3f}x"
+    )
+    print(
+        f"fused-rms logits max_abs_error={fused_rms_error.max().item():.6g}, "
+        f"mean_abs_error={fused_rms_error.mean().item():.6g}, "
+        f"top1_match={torch.equal(native_top1, fused_rms_top1)}"
+    )
+    print(
+        f"fused-add logits max_abs_error={fused_add_error.max().item():.6g}, "
+        f"mean_abs_error={fused_add_error.mean().item():.6g}, "
+        f"top1_match={torch.equal(native_top1, fused_add_top1)}"
+    )
+    print(
+        "peak allocated memory: "
+        f"native={native_peak_gib:.3f} GiB, "
+        f"fused-rms={fused_rms_peak_gib:.3f} GiB, "
+        f"fused-add={fused_add_peak_gib:.3f} GiB"
     )
 
 
