@@ -57,6 +57,7 @@ def _report(name: str, timings: list[float], operations: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=1)
     parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument("--out-dim", type=int, default=4096)
     parser.add_argument("--eps", type=float, default=1e-6)
@@ -72,8 +73,15 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.batch <= 0 or args.hidden_dim <= 0 or args.out_dim <= 0:
-        raise ValueError("batch, hidden-dim, and out-dim must be positive")
+    if (
+        args.batch <= 0
+        or args.seq_len <= 0
+        or args.hidden_dim <= 0
+        or args.out_dim <= 0
+    ):
+        raise ValueError(
+            "batch, seq-len, hidden-dim, and out-dim must be positive"
+        )
 
     torch.manual_seed(20260714)
     device = torch.device("cuda")
@@ -96,7 +104,7 @@ def main() -> None:
     fused_layer = FusedRMSNormLinear(rmsnorm, linear).eval()
     x = torch.randn(
         args.batch,
-        1,
+        args.seq_len,
         args.hidden_dim,
         device=device,
         dtype=dtype,
@@ -120,9 +128,12 @@ def main() -> None:
 
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
+        token_count = args.batch * args.seq_len
+        dispatch = "decode" if token_count < 8 else "prefill"
         print(
-            f"B={args.batch}, K={args.hidden_dim}, N={args.out_dim}, "
-            f"eps={args.eps:g}, bias={args.bias}"
+            f"B={args.batch}, S={args.seq_len}, M={token_count}, "
+            f"K={args.hidden_dim}, N={args.out_dim}, "
+            f"eps={args.eps:g}, bias={args.bias}, dispatch={dispatch}"
         )
         print(f"fused weight shape: {tuple(fused_layer.fused_weight.shape)}")
 
@@ -145,7 +156,13 @@ def main() -> None:
 
     # Count the dominant Linear operations. RMSNorm and the fused auxiliary
     # reduction are intentionally excluded so both rows use the same metric.
-    operations = 2 * args.batch * args.hidden_dim * args.out_dim
+    operations = (
+        2
+        * args.batch
+        * args.seq_len
+        * args.hidden_dim
+        * args.out_dim
+    )
     _report("FusedRMSNormLinear", fused_times, operations)
     _report("PyTorch RMSNorm + Linear", pytorch_times, operations)
     print(

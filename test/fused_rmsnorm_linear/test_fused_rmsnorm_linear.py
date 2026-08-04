@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -11,6 +12,59 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from layers.fused_rmsnorm_linear import FusedRMSNormLinear
 from layers.fused_rmsnorm_linear.reference import rmsnorm_linear_ref
+
+
+@pytest.mark.parametrize(
+    ("batch", "seq_len", "expected_path"),
+    [(1, 7, "decode"), (2, 4, "prefill")],
+)
+def test_layer_dispatches_on_flattened_token_count(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: int,
+    seq_len: int,
+    expected_path: str,
+) -> None:
+    layer_module = importlib.import_module("layers.fused_rmsnorm_linear")
+    rmsnorm = nn.RMSNorm(16, eps=1e-6, dtype=torch.float16)
+    linear = nn.Linear(16, 32, bias=False, dtype=torch.float16)
+    layer = FusedRMSNormLinear(rmsnorm, linear)
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def fake_decode(
+        x: torch.Tensor,
+        fused_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        calls.append(("decode", tuple(x.shape)))
+        return torch.empty(x.shape[0], 1, 32, dtype=x.dtype)
+
+    def fake_prefill(
+        x: torch.Tensor,
+        fused_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        calls.append(("prefill", tuple(x.shape)))
+        return torch.empty(batch, seq_len, 32, dtype=x.dtype)
+
+    monkeypatch.setattr(layer_module, "fused_rmsnorm_linear_fp16", fake_decode)
+    monkeypatch.setattr(
+        layer_module,
+        "fused_rmsnorm_linear_prefill_fp16",
+        fake_prefill,
+    )
+    x = torch.randn(batch, seq_len, 16, dtype=torch.float16)
+
+    output = layer(x)
+
+    assert output.shape == (batch, seq_len, 32)
+    assert calls == [
+        (
+            expected_path,
+            (batch * seq_len, 1, 16)
+            if expected_path == "decode"
+            else (batch, seq_len, 16),
+        )
+    ]
 
 
 def test_init_precomputes_fused_weight() -> None:

@@ -11,6 +11,10 @@ from .cuda import (
     fused_rmsnorm_linear_bias_fp16,
     fused_rmsnorm_linear_fp16,
 )
+from .prefill_cuda import (
+    fused_rmsnorm_linear_prefill_bias_fp16,
+    fused_rmsnorm_linear_prefill_fp16,
+)
 
 
 DEFAULT_EPS = 1e-6
@@ -35,11 +39,10 @@ class FusedRMSNormLinear(nn.Module):
 
         fused_weight = linear.weight * rmsnorm.weight
 
-    For an input ``x`` shaped [Batch, 1, HiddenDim], the specialized CUDA path
-    computes ``x @ fused_weight.T`` and one FP32 ``sum(x.square())`` reduction,
-    then applies the inverse RMS scale in a lightweight CUDA epilogue. If the
-    source Linear has a bias, it is added after RMS scaling, matching
-    ``linear(rmsnorm(x))``.
+    The forward pass dispatches on the flattened token count ``M=Batch*SeqLen``.
+    ``M < 8`` uses the specialized small-M/decode CUDA kernel; ``M >= 8`` uses
+    the CUTLASS Tensor Core prefill kernel. If the source Linear has a bias, it
+    is added after RMS scaling, matching ``linear(rmsnorm(x))``.
 
     The source modules are not retained. Their weights are snapshotted into a
     registered buffer, so this layer is intended for fixed-weight inference.
@@ -86,29 +89,64 @@ class FusedRMSNormLinear(nn.Module):
         """Apply fused RMSNorm and Linear.
 
         Args:
-            x: Contiguous FP16 CUDA tensor shaped [Batch, 1, HiddenDim].
+            x: Contiguous FP16 CUDA tensor shaped
+                [Batch, SeqLen, HiddenDim].
 
         Returns:
-            FP16 tensor shaped [Batch, 1, OutDim].
+            FP16 tensor shaped [Batch, SeqLen, OutDim].
         """
-        if x.ndim != 3 or x.shape[1] != 1 or x.shape[2] != self.hidden_dim:
+        if x.ndim != 3 or x.shape[2] != self.hidden_dim:
             raise ValueError(
-                "x must have shape [Batch, 1, HiddenDim], got "
+                "x must have shape [Batch, SeqLen, HiddenDim], got "
                 f"{tuple(x.shape)} with expected HiddenDim={self.hidden_dim}"
             )
+        if x.shape[0] <= 0 or x.shape[1] <= 0:
+            raise ValueError("Batch and SeqLen must be positive")
+        if not x.is_contiguous():
+            raise ValueError("x must be contiguous")
         if x.device != self.fused_weight.device:
             raise ValueError("x and fused_weight must be on the same device")
         if x.dtype != self.fused_weight.dtype:
             raise TypeError("x and fused_weight must have the same dtype")
 
-        if self.bias is not None:
-            return fused_rmsnorm_linear_bias_fp16(
+        batch, seq_len = x.shape[:2]
+        token_count = batch * seq_len
+        prefill_compatible = (
+            self.hidden_dim % 16 == 0 and self.out_dim % 16 == 0
+        )
+        if token_count >= 8 and prefill_compatible:
+            if self.bias is not None:
+                return fused_rmsnorm_linear_prefill_bias_fp16(
+                    x,
+                    self.fused_weight,
+                    self.bias,
+                    self.eps,
+                )
+            return fused_rmsnorm_linear_prefill_fp16(
                 x,
+                self.fused_weight,
+                self.eps,
+            )
+
+        if token_count > 8:
+            raise ValueError(
+                "M >= 8 requires HiddenDim and OutDim divisible by 16 for "
+                "the prefill Tensor Core kernel"
+            )
+
+        decode_input = x.view(token_count, 1, self.hidden_dim)
+        if self.bias is not None:
+            output = fused_rmsnorm_linear_bias_fp16(
+                decode_input,
                 self.fused_weight,
                 self.bias,
                 self.eps,
             )
-        return fused_rmsnorm_linear_fp16(x, self.fused_weight, self.eps)
+        else:
+            output = fused_rmsnorm_linear_fp16(
+                decode_input, self.fused_weight, self.eps
+            )
+        return output.view(batch, seq_len, self.out_dim)
 
 
 class FusedAddRMSNormLinear(FusedRMSNormLinear):
