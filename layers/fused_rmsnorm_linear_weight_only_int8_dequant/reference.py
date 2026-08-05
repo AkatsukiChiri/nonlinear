@@ -16,6 +16,8 @@ def weight_only_int8_dequant_ref(
     """Round each dequantized weight to FP16 before FP32 dot accumulation."""
     batch, _, hidden_dim = x.shape
     out_dim = quantized_weight.shape[0]
+    if weight_scale.shape[1] == 1:
+        group_size = hidden_dim
     group_count = hidden_dim // group_size
     weight = quantized_weight.reshape(out_dim, group_count, group_size).float()
     weight = (weight * weight_scale.unsqueeze(-1)).to(torch.float16).float()

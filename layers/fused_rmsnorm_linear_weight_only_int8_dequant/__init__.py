@@ -35,7 +35,9 @@ class FusedRMSNormLinearWeightOnlyInt8Dequant(nn.Module):
         self.out_dim = linear.out_features
         with torch.no_grad():
             fused_weight = linear.weight * rms_weight.unsqueeze(0)
-            quantized_weight, weight_scale = quantize_weight_symmetric_int8(fused_weight)
+            quantized_weight, weight_scale = quantize_weight_symmetric_int8(
+                fused_weight, linear.in_features
+            )
         self.register_buffer("quantized_weight", quantized_weight)
         self.register_buffer("weight_scale", weight_scale)
         self.register_buffer(

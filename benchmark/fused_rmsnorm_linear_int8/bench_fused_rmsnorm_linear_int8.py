@@ -64,6 +64,7 @@ def _report(name: str, timings: list[float], operations: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=1)
     parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument("--out-dim", type=int, default=4096)
     parser.add_argument("--eps", type=float, default=1e-6)
@@ -79,8 +80,13 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.batch <= 0 or args.hidden_dim <= 0 or args.out_dim <= 0:
-        raise ValueError("batch, hidden-dim, and out-dim must be positive")
+    if (
+        args.batch <= 0
+        or args.seq_len <= 0
+        or args.hidden_dim <= 0
+        or args.out_dim <= 0
+    ):
+        raise ValueError("batch, seq-len, hidden-dim, and out-dim must be positive")
     if args.hidden_dim % 64 != 0:
         raise ValueError("hidden-dim must be divisible by 64")
 
@@ -105,11 +111,21 @@ def main() -> None:
 
     fp16_fused_layer = FusedRMSNormLinear(rmsnorm, linear).eval()
     int8_fused_layer = FusedRMSNormLinearInt8(rmsnorm, linear).eval()
-    mixed_layer = FusedRMSNormLinearWeightOnlyInt8Mixed(rmsnorm, linear).eval()
-    dequant_layer = FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
+    token_count = args.batch * args.seq_len
+    benchmark_decode_variants = args.seq_len == 1 and args.batch <= 8
+    mixed_layer = (
+        FusedRMSNormLinearWeightOnlyInt8Mixed(rmsnorm, linear).eval()
+        if benchmark_decode_variants
+        else None
+    )
+    dequant_layer = (
+        FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
+        if benchmark_decode_variants
+        else None
+    )
     x = torch.randn(
         args.batch,
-        1,
+        args.seq_len,
         args.hidden_dim,
         device=device,
         dtype=dtype,
@@ -122,9 +138,11 @@ def main() -> None:
         return fp16_fused_layer(x)
 
     def mixed_forward() -> torch.Tensor:
+        assert mixed_layer is not None
         return mixed_layer(x)
 
     def dequant_forward() -> torch.Tensor:
+        assert dequant_layer is not None
         return dequant_layer(x)
 
     def pytorch_fp16_forward() -> torch.Tensor:
@@ -132,8 +150,8 @@ def main() -> None:
 
     with torch.inference_mode():
         int8_check = int8_fused_forward()
-        mixed_check = mixed_forward()
-        dequant_check = dequant_forward()
+        mixed_check = mixed_forward() if benchmark_decode_variants else None
+        dequant_check = dequant_forward() if benchmark_decode_variants else None
         fp16_fused_check = fp16_fused_forward()
         pytorch_check = pytorch_fp16_forward()
         torch.testing.assert_close(
@@ -148,14 +166,20 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
-        torch.testing.assert_close(mixed_check, pytorch_check, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(dequant_check, pytorch_check, atol=5e-2, rtol=5e-2)
+        if mixed_check is not None and dequant_check is not None:
+            torch.testing.assert_close(
+                mixed_check, pytorch_check, atol=5e-2, rtol=5e-2
+            )
+            torch.testing.assert_close(
+                dequant_check, pytorch_check, atol=5e-2, rtol=5e-2
+            )
 
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
         print(
-            f"B={args.batch}, K={args.hidden_dim}, N={args.out_dim}, "
-            f"eps={args.eps:g}, bias={args.bias}, group_size=64"
+            f"B={args.batch}, S={args.seq_len}, M={token_count}, "
+            f"K={args.hidden_dim}, N={args.out_dim}, eps={args.eps:g}, "
+            f"bias={args.bias}, dispatch={'decode' if token_count <= 8 else 'prefill'}"
         )
         print(
             "INT8 weight shape: "
@@ -168,16 +192,15 @@ def main() -> None:
             args.warmup,
             args.iterations,
         )
-        mixed_output, mixed_times = _measure(
-            mixed_forward,
-            args.warmup,
-            args.iterations,
-        )
-        dequant_output, dequant_times = _measure(
-            dequant_forward,
-            args.warmup,
-            args.iterations,
-        )
+        mixed_output, mixed_times = (None, [])
+        dequant_output, dequant_times = (None, [])
+        if benchmark_decode_variants:
+            mixed_output, mixed_times = _measure(
+                mixed_forward, args.warmup, args.iterations
+            )
+            dequant_output, dequant_times = _measure(
+                dequant_forward, args.warmup, args.iterations
+            )
         fp16_fused_output, fp16_fused_times = _measure(
             fp16_fused_forward,
             args.warmup,
@@ -200,13 +223,19 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
-        torch.testing.assert_close(mixed_output, pytorch_output, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(dequant_output, pytorch_output, atol=5e-2, rtol=5e-2)
+        if mixed_output is not None and dequant_output is not None:
+            torch.testing.assert_close(
+                mixed_output, pytorch_output, atol=5e-2, rtol=5e-2
+            )
+            torch.testing.assert_close(
+                dequant_output, pytorch_output, atol=5e-2, rtol=5e-2
+            )
 
-    operations = 2 * args.batch * args.hidden_dim * args.out_dim
+    operations = 2 * token_count * args.hidden_dim * args.out_dim
     _report("INT8 FusedRMSNormLinear", int8_times, operations)
-    _report("INT8 weight-only FP32 mixed", mixed_times, operations)
-    _report("INT8 weight-only FP16 dequant", dequant_times, operations)
+    if benchmark_decode_variants:
+        _report("INT8 weight-only FP32 mixed", mixed_times, operations)
+        _report("INT8 weight-only FP16 dequant", dequant_times, operations)
     _report("FP16 FusedRMSNormLinear", fp16_fused_times, operations)
     _report("PyTorch FP16 RMSNorm+Linear", pytorch_times, operations)
     int8_mean = statistics.mean(int8_times)
@@ -222,6 +251,8 @@ def main() -> None:
         ("weight-only FP32 mixed", mixed_times),
         ("weight-only FP16 dequant", dequant_times),
     ):
+        if not timings:
+            continue
         mean = statistics.mean(timings)
         print(
             f"{name} speedup vs FP16 fused: "

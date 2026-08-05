@@ -6,7 +6,7 @@
 #include <torch/extension.h>
 
 void launch_projection(const half*, const signed char*, const float*, const half*,
-                       half*, float*, int, int, int, float, cudaStream_t);
+                       half*, float*, float*, int, int, int, float, cudaStream_t);
 
 torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
                       std::optional<torch::Tensor> bias, double eps) {
@@ -18,7 +18,7 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale
   TORCH_CHECK(x.dim() == 3 && x.size(1) == 1, "x must be [Batch, 1, HiddenDim]");
   TORCH_CHECK(weight.dim() == 2 && weight.size(1) == x.size(2), "invalid weight shape");
   TORCH_CHECK(x.size(2) % 64 == 0, "HiddenDim must be divisible by 64");
-  TORCH_CHECK(scale.sizes() == torch::IntArrayRef({weight.size(0), x.size(2) / 64}), "invalid scale shape");
+  TORCH_CHECK(scale.sizes() == torch::IntArrayRef({weight.size(0), 1}), "invalid scale shape");
   TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8, "Batch must be in [1, 8]");
   TORCH_CHECK(x.is_contiguous() && weight.is_contiguous() && scale.is_contiguous(), "inputs must be contiguous");
   const half* bias_pointer = nullptr;
@@ -30,12 +30,15 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale
   }
   const c10::cuda::CUDAGuard guard(x.device());
   auto output = torch::empty({x.size(0), 1, weight.size(0)}, x.options());
+  auto partial = torch::empty({4, x.size(0), weight.size(0)},
+                              x.options().dtype(torch::kFloat32));
   auto square_sum = torch::empty({x.size(0)}, x.options().dtype(torch::kFloat32));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   launch_projection(reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
       reinterpret_cast<const signed char*>(weight.data_ptr<int8_t>()), scale.data_ptr<float>(),
       bias_pointer, reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-      square_sum.data_ptr<float>(), x.size(0), weight.size(0), x.size(2),
+      partial.data_ptr<float>(), square_sum.data_ptr<float>(), x.size(0),
+      weight.size(0), x.size(2),
       static_cast<float>(eps), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;

@@ -33,12 +33,15 @@ def test_layer_prequantizes_weight(layer_type: type[nn.Module]) -> None:
     layer = layer_type(rmsnorm, linear)
     assert layer.quantized_weight.shape == (17, 128)
     assert layer.quantized_weight.dtype == torch.int8
-    assert layer.weight_scale.shape == (17, 2)
+    expected_groups = (
+        1 if layer_type is FusedRMSNormLinearWeightOnlyInt8Dequant else 2
+    )
+    assert layer.weight_scale.shape == (17, expected_groups)
     assert layer.weight_scale.dtype == torch.float32
     assert dict(layer.named_parameters()) == {}
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+@pytest.mark.parametrize("batch", range(1, 9))
 @pytest.mark.parametrize("bias", [False, True])
 def test_cuda_variants_match_references(batch: int, bias: bool) -> None:
     if not torch.cuda.is_available():
