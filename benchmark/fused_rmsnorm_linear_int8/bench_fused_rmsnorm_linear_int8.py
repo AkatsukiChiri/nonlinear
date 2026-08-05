@@ -18,9 +18,6 @@ from layers.fused_rmsnorm_linear_int8 import FusedRMSNormLinearInt8
 from layers.fused_rmsnorm_linear_weight_only_int8_dequant import (
     FusedRMSNormLinearWeightOnlyInt8Dequant,
 )
-from layers.fused_rmsnorm_linear_weight_only_int8_mixed import (
-    FusedRMSNormLinearWeightOnlyInt8Mixed,
-)
 
 
 def _measure(
@@ -113,11 +110,6 @@ def main() -> None:
     int8_fused_layer = FusedRMSNormLinearInt8(rmsnorm, linear).eval()
     token_count = args.batch * args.seq_len
     benchmark_decode_variants = args.seq_len == 1 and args.batch <= 8
-    mixed_layer = (
-        FusedRMSNormLinearWeightOnlyInt8Mixed(rmsnorm, linear).eval()
-        if benchmark_decode_variants
-        else None
-    )
     dequant_layer = (
         FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
         if benchmark_decode_variants
@@ -137,10 +129,6 @@ def main() -> None:
     def fp16_fused_forward() -> torch.Tensor:
         return fp16_fused_layer(x)
 
-    def mixed_forward() -> torch.Tensor:
-        assert mixed_layer is not None
-        return mixed_layer(x)
-
     def dequant_forward() -> torch.Tensor:
         assert dequant_layer is not None
         return dequant_layer(x)
@@ -150,7 +138,6 @@ def main() -> None:
 
     with torch.inference_mode():
         int8_check = int8_fused_forward()
-        mixed_check = mixed_forward() if benchmark_decode_variants else None
         dequant_check = dequant_forward() if benchmark_decode_variants else None
         fp16_fused_check = fp16_fused_forward()
         pytorch_check = pytorch_fp16_forward()
@@ -166,10 +153,7 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
-        if mixed_check is not None and dequant_check is not None:
-            torch.testing.assert_close(
-                mixed_check, pytorch_check, atol=5e-2, rtol=5e-2
-            )
+        if dequant_check is not None:
             torch.testing.assert_close(
                 dequant_check, pytorch_check, atol=5e-2, rtol=5e-2
             )
@@ -192,12 +176,8 @@ def main() -> None:
             args.warmup,
             args.iterations,
         )
-        mixed_output, mixed_times = (None, [])
         dequant_output, dequant_times = (None, [])
         if benchmark_decode_variants:
-            mixed_output, mixed_times = _measure(
-                mixed_forward, args.warmup, args.iterations
-            )
             dequant_output, dequant_times = _measure(
                 dequant_forward, args.warmup, args.iterations
             )
@@ -223,10 +203,7 @@ def main() -> None:
             atol=5e-2,
             rtol=5e-2,
         )
-        if mixed_output is not None and dequant_output is not None:
-            torch.testing.assert_close(
-                mixed_output, pytorch_output, atol=5e-2, rtol=5e-2
-            )
+        if dequant_output is not None:
             torch.testing.assert_close(
                 dequant_output, pytorch_output, atol=5e-2, rtol=5e-2
             )
@@ -234,7 +211,6 @@ def main() -> None:
     operations = 2 * token_count * args.hidden_dim * args.out_dim
     _report("INT8 FusedRMSNormLinear", int8_times, operations)
     if benchmark_decode_variants:
-        _report("INT8 weight-only FP32 mixed", mixed_times, operations)
         _report("INT8 weight-only FP16 dequant", dequant_times, operations)
     _report("FP16 FusedRMSNormLinear", fp16_fused_times, operations)
     _report("PyTorch FP16 RMSNorm+Linear", pytorch_times, operations)
@@ -247,10 +223,7 @@ def main() -> None:
         "INT8 speedup vs PyTorch FP16: "
         f"{statistics.mean(pytorch_times) / int8_mean:.3f}x"
     )
-    for name, timings in (
-        ("weight-only FP32 mixed", mixed_times),
-        ("weight-only FP16 dequant", dequant_times),
-    ):
+    for name, timings in (("weight-only FP16 dequant", dequant_times),):
         if not timings:
             continue
         mean = statistics.mean(timings)
