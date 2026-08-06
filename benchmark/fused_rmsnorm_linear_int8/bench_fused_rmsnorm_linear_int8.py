@@ -14,17 +14,20 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from layers.fused_rmsnorm_linear import FusedRMSNormLinear
-from layers.fused_rmsnorm_linear_int8 import FusedRMSNormLinearInt8
-from layers.fused_rmsnorm_linear_weight_only_int8_dequant import (
-    FusedRMSNormLinearWeightOnlyInt8Dequant,
+from layers.fused_rmsnorm_linear_int8 import (
+    FusedRMSNormLinearInt8Decode,
+    FusedRMSNormLinearInt8Prefill,
 )
 
 
+Output = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
 def _measure(
-    function: Callable[[], torch.Tensor],
+    function: Callable[[], Output],
     warmup: int,
     iterations: int,
-) -> tuple[torch.Tensor, list[float]]:
+) -> tuple[Output, list[float]]:
     for _ in range(warmup):
         output = function()
     torch.cuda.synchronize()
@@ -68,10 +71,26 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument(
+        "--dtype",
+        choices=("float16", "bfloat16"),
+        default="float16",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("decode", "prefill"),
+        required=True,
+        help="Select the fixed INT8 implementation; no token-count dispatch.",
+    )
+    parser.add_argument(
         "--bias",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="benchmark a Linear with bias (default: --no-bias)",
+    )
+    parser.add_argument(
+        "--fused-add",
+        action="store_true",
+        help="Fuse x + x_res and return the updated residual.",
     )
     args = parser.parse_args()
 
@@ -89,7 +108,7 @@ def main() -> None:
 
     torch.manual_seed(20260716)
     device = torch.device("cuda")
-    dtype = torch.float16
+    dtype = getattr(torch, args.dtype)
     rmsnorm = nn.RMSNorm(
         args.hidden_dim,
         eps=args.eps,
@@ -106,15 +125,18 @@ def main() -> None:
     with torch.no_grad():
         rmsnorm.weight.normal_(mean=1.0, std=0.1)
 
-    fp16_fused_layer = FusedRMSNormLinear(rmsnorm, linear).eval()
-    int8_fused_layer = FusedRMSNormLinearInt8(rmsnorm, linear).eval()
-    token_count = args.batch * args.seq_len
-    benchmark_decode_variants = args.seq_len == 1 and args.batch <= 8
-    dequant_layer = (
-        FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
-        if benchmark_decode_variants
+    fp16_fused_layer = (
+        FusedRMSNormLinear(rmsnorm, linear).eval()
+        if dtype == torch.float16
         else None
     )
+    token_count = args.batch * args.seq_len
+    if args.mode == "decode":
+        if args.seq_len != 1 or not 1 <= args.batch <= 8:
+            raise ValueError("decode mode requires seq-len=1 and batch in [1, 8]")
+        int8_fused_layer = FusedRMSNormLinearInt8Decode(rmsnorm, linear).eval()
+    else:
+        int8_fused_layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear).eval()
     x = torch.randn(
         args.batch,
         args.seq_len,
@@ -122,48 +144,60 @@ def main() -> None:
         device=device,
         dtype=dtype,
     ) / 4
+    x_res = torch.randn_like(x) / 4 if args.fused_add else None
 
-    def int8_fused_forward() -> torch.Tensor:
-        return int8_fused_layer(x)
+    def int8_fused_forward() -> Output:
+        return int8_fused_layer(x, x_res) if x_res is not None else int8_fused_layer(x)
 
-    def fp16_fused_forward() -> torch.Tensor:
+    def fp16_fused_forward() -> Output:
+        assert fp16_fused_layer is not None
+        if x_res is not None:
+            residual_sum = x + x_res
+            return fp16_fused_layer(residual_sum), residual_sum
         return fp16_fused_layer(x)
 
-    def dequant_forward() -> torch.Tensor:
-        assert dequant_layer is not None
-        return dequant_layer(x)
+    def separate_add_int8_forward() -> Output:
+        assert x_res is not None
+        residual_sum = x + x_res
+        return int8_fused_layer(residual_sum), residual_sum
 
-    def pytorch_fp16_forward() -> torch.Tensor:
+    def pytorch_forward() -> Output:
+        if x_res is not None:
+            residual_sum = x + x_res
+            return linear(rmsnorm(residual_sum)), residual_sum
         return linear(rmsnorm(x))
+
+    def check_output(actual: Output, expected: Output, tolerance: float) -> None:
+        if isinstance(actual, tuple):
+            assert isinstance(expected, tuple)
+            torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+            torch.testing.assert_close(
+                actual[0], expected[0], atol=tolerance, rtol=tolerance
+            )
+        else:
+            assert isinstance(expected, torch.Tensor)
+            torch.testing.assert_close(
+                actual, expected, atol=tolerance, rtol=tolerance
+            )
 
     with torch.inference_mode():
         int8_check = int8_fused_forward()
-        dequant_check = dequant_forward() if benchmark_decode_variants else None
-        fp16_fused_check = fp16_fused_forward()
-        pytorch_check = pytorch_fp16_forward()
-        torch.testing.assert_close(
-            fp16_fused_check,
-            pytorch_check,
-            atol=1e-2,
-            rtol=1e-2,
+        fp16_fused_check = (
+            fp16_fused_forward() if fp16_fused_layer is not None else None
         )
-        torch.testing.assert_close(
-            int8_check,
-            pytorch_check,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-        if dequant_check is not None:
-            torch.testing.assert_close(
-                dequant_check, pytorch_check, atol=5e-2, rtol=5e-2
-            )
-
+        pytorch_check = pytorch_forward()
+        if fp16_fused_check is not None:
+            check_output(fp16_fused_check, pytorch_check, 1e-2)
+        check_output(int8_check, pytorch_check, 5e-2)
         print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
+        print(
+            f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}, "
+            f"dtype={args.dtype}"
+        )
         print(
             f"B={args.batch}, S={args.seq_len}, M={token_count}, "
             f"K={args.hidden_dim}, N={args.out_dim}, eps={args.eps:g}, "
-            f"bias={args.bias}, dispatch={'decode' if token_count <= 8 else 'prefill'}"
+            f"bias={args.bias}, mode={args.mode}, fused_add={args.fused_add}"
         )
         print(
             "INT8 weight shape: "
@@ -176,65 +210,61 @@ def main() -> None:
             args.warmup,
             args.iterations,
         )
-        dequant_output, dequant_times = (None, [])
-        if benchmark_decode_variants:
-            dequant_output, dequant_times = _measure(
-                dequant_forward, args.warmup, args.iterations
+        separate_int8_output, separate_int8_times = (None, [])
+        if x_res is not None:
+            separate_int8_output, separate_int8_times = _measure(
+                separate_add_int8_forward,
+                args.warmup,
+                args.iterations,
             )
-        fp16_fused_output, fp16_fused_times = _measure(
-            fp16_fused_forward,
-            args.warmup,
-            args.iterations,
-        )
+        fp16_fused_output, fp16_fused_times = (None, [])
+        if fp16_fused_layer is not None:
+            fp16_fused_output, fp16_fused_times = _measure(
+                fp16_fused_forward,
+                args.warmup,
+                args.iterations,
+            )
         pytorch_output, pytorch_times = _measure(
-            pytorch_fp16_forward,
+            pytorch_forward,
             args.warmup,
             args.iterations,
         )
-        torch.testing.assert_close(
-            fp16_fused_output,
-            pytorch_output,
-            atol=1e-2,
-            rtol=1e-2,
-        )
-        torch.testing.assert_close(
-            int8_output,
-            pytorch_output,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-        if dequant_output is not None:
-            torch.testing.assert_close(
-                dequant_output, pytorch_output, atol=5e-2, rtol=5e-2
-            )
+        if fp16_fused_output is not None:
+            check_output(fp16_fused_output, pytorch_output, 1e-2)
+        if separate_int8_output is not None:
+            check_output(separate_int8_output, pytorch_output, 5e-2)
+        check_output(int8_output, pytorch_output, 5e-2)
 
     operations = 2 * token_count * args.hidden_dim * args.out_dim
-    _report("INT8 FusedRMSNormLinear", int8_times, operations)
-    if benchmark_decode_variants:
-        _report("INT8 weight-only FP16 dequant", dequant_times, operations)
-    _report("FP16 FusedRMSNormLinear", fp16_fused_times, operations)
-    _report("PyTorch FP16 RMSNorm+Linear", pytorch_times, operations)
-    int8_mean = statistics.mean(int8_times)
-    print(
-        "INT8 speedup vs FP16 fused: "
-        f"{statistics.mean(fp16_fused_times) / int8_mean:.3f}x"
+    int8_name = (
+        "INT8 FusedAddRMSNormLinear"
+        if args.fused_add
+        else "INT8 FusedRMSNormLinear"
     )
+    _report(int8_name, int8_times, operations)
+    if separate_int8_times:
+        _report("Add + INT8 FusedRMSNormLinear", separate_int8_times, operations)
+    if fp16_fused_times:
+        _report("FP16 FusedRMSNormLinear", fp16_fused_times, operations)
+    pytorch_name = f"PyTorch {args.dtype} " + (
+        "Add+RMSNorm+Linear" if args.fused_add else "RMSNorm+Linear"
+    )
+    _report(pytorch_name, pytorch_times, operations)
+    int8_mean = statistics.mean(int8_times)
+    if separate_int8_times:
+        print(
+            "Fused-add speedup vs separate add + INT8: "
+            f"{statistics.mean(separate_int8_times) / int8_mean:.3f}x"
+        )
+    if fp16_fused_times:
+        print(
+            "INT8 speedup vs FP16 fused: "
+            f"{statistics.mean(fp16_fused_times) / int8_mean:.3f}x"
+        )
     print(
-        "INT8 speedup vs PyTorch FP16: "
+        f"INT8 speedup vs PyTorch {args.dtype}: "
         f"{statistics.mean(pytorch_times) / int8_mean:.3f}x"
     )
-    for name, timings in (("weight-only FP16 dequant", dequant_times),):
-        if not timings:
-            continue
-        mean = statistics.mean(timings)
-        print(
-            f"{name} speedup vs FP16 fused: "
-            f"{statistics.mean(fp16_fused_times) / mean:.3f}x"
-        )
-        print(
-            f"{name} speedup vs PyTorch FP16: "
-            f"{statistics.mean(pytorch_times) / mean:.3f}x"
-        )
 
 
 if __name__ == "__main__":

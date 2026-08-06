@@ -18,7 +18,7 @@ from layers.fused_rmsnorm_linear_weight_only_int4_dequant import (
     FusedRMSNormLinearWeightOnlyInt4Dequant,
 )
 from layers.fused_rmsnorm_linear_weight_only_int8_dequant import (
-    FusedRMSNormLinearWeightOnlyInt8Dequant,
+    FusedRMSNormLinearInt8Decode,
 )
 
 
@@ -75,7 +75,7 @@ def main() -> None:
     with torch.no_grad():
         rmsnorm.weight.normal_(1.0, 0.1)
     int4_layer = FusedRMSNormLinearWeightOnlyInt4Dequant(rmsnorm, linear).eval()
-    int8_layer = FusedRMSNormLinearWeightOnlyInt8Dequant(rmsnorm, linear).eval()
+    int8_layer = FusedRMSNormLinearInt8Decode(rmsnorm, linear).eval()
     fp16_layer = FusedRMSNormLinear(rmsnorm, linear).eval()
     x = torch.randn(
         args.batch, 1, args.hidden_dim, device="cuda", dtype=torch.float16

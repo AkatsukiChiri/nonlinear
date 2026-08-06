@@ -13,6 +13,7 @@ from layers.fused_rmsnorm_linear_int8_prefill import (
     FusedRMSNormLinearInt8Prefill,
 )
 from layers.fused_rmsnorm_linear_int8_prefill.reference import (
+    fused_add_rmsnorm_linear_int8_prefill_ref,
     fused_rmsnorm_linear_int8_prefill_ref,
 )
 
@@ -25,6 +26,7 @@ def _require_ampere() -> None:
 
 
 @pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     ("batch", "seq_len", "hidden_dim", "out_dim"),
     [(2, 7, 128, 96), (4, 8, 256, 320)],
@@ -35,17 +37,18 @@ def test_int8_prefill_matches_quantized_reference(
     hidden_dim: int,
     out_dim: int,
     bias: bool,
+    dtype: torch.dtype,
 ) -> None:
     _require_ampere()
     torch.manual_seed(20260804)
     rmsnorm = nn.RMSNorm(
-        hidden_dim, eps=1e-6, device="cuda", dtype=torch.float16
+        hidden_dim, eps=1e-6, device="cuda", dtype=dtype
     )
     linear = nn.Linear(
-        hidden_dim, out_dim, bias=bias, device="cuda", dtype=torch.float16
+        hidden_dim, out_dim, bias=bias, device="cuda", dtype=dtype
     )
     x = torch.randn(
-        batch, seq_len, hidden_dim, device="cuda", dtype=torch.float16
+        batch, seq_len, hidden_dim, device="cuda", dtype=dtype
     ) / 4
     layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear)
     expected = fused_rmsnorm_linear_int8_prefill_ref(
@@ -53,7 +56,8 @@ def test_int8_prefill_matches_quantized_reference(
     )
     actual = layer(x)
     assert actual.shape == (batch, seq_len, out_dim)
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0.0)
+    tolerance = 2e-2 if dtype == torch.float16 else 4e-2
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=0.0)
 
 
 def test_int8_prefill_weight_is_compact() -> None:
@@ -86,3 +90,57 @@ def test_int8_prefill_default_shape_matches_quantized_reference() -> None:
         x, layer.quantized_weight, layer.weight_scale, layer.eps
     )
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_fused_add_int8_prefill_matches_reference(
+    dtype: torch.dtype, bias: bool
+) -> None:
+    _require_ampere()
+    torch.manual_seed(20260806)
+    batch, seq_len, hidden_dim, out_dim = 2, 7, 128, 96
+    rmsnorm = nn.RMSNorm(
+        hidden_dim, eps=1e-6, device="cuda", dtype=dtype
+    )
+    linear = nn.Linear(
+        hidden_dim, out_dim, bias=bias, device="cuda", dtype=dtype
+    )
+    x = torch.randn(
+        batch, seq_len, hidden_dim, device="cuda", dtype=dtype
+    ) / 4
+    x_res = torch.randn_like(x) / 4
+    layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear)
+
+    expected_output, expected_residual = (
+        fused_add_rmsnorm_linear_int8_prefill_ref(
+            x,
+            x_res,
+            layer.quantized_weight,
+            layer.weight_scale,
+            layer.eps,
+            layer.bias,
+        )
+    )
+    actual_output, actual_residual = layer(x, x_res)
+    tolerance = 2e-2 if dtype == torch.float16 else 4e-2
+    torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual_output, expected_output, atol=tolerance, rtol=0.0
+    )
+
+
+def test_fused_add_prefill_reuses_output_and_workspace_buffers() -> None:
+    _require_ampere()
+    rmsnorm = nn.RMSNorm(128, eps=1e-6, device="cuda", dtype=torch.float16)
+    linear = nn.Linear(128, 96, bias=False, device="cuda", dtype=torch.float16)
+    layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear)
+    x = torch.randn(2, 7, 128, device="cuda", dtype=torch.float16)
+    x_res = torch.randn_like(x)
+
+    first_output, first_residual = layer(x, x_res)
+    second_output, second_residual = layer(x, x_res)
+
+    assert first_output.data_ptr() == second_output.data_ptr()
+    assert first_residual.data_ptr() == second_residual.data_ptr()
+    assert len(layer._fused_add_buffers) == 1

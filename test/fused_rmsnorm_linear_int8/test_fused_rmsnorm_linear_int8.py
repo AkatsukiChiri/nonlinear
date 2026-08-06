@@ -9,7 +9,10 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from layers.fused_rmsnorm_linear_int8 import FusedRMSNormLinearInt8
+from layers.fused_rmsnorm_linear_int8 import (
+    FusedRMSNormLinearInt8Decode,
+    FusedRMSNormLinearInt8Prefill,
+)
 from layers.fused_rmsnorm_linear_int8.quantization import (
     quantize_weight_symmetric_int8,
 )
@@ -36,16 +39,16 @@ def test_weight_quantization_uses_groups_of_64() -> None:
 def test_layer_prequantizes_fused_weight() -> None:
     rmsnorm = nn.RMSNorm(128, eps=1e-6, dtype=torch.float16)
     linear = nn.Linear(128, 24, bias=True, dtype=torch.float16)
-    layer = FusedRMSNormLinearInt8(rmsnorm, linear)
+    layer = FusedRMSNormLinearInt8Decode(rmsnorm, linear)
     expected_weight = linear.weight * rmsnorm.weight.unsqueeze(0)
     expected_quantized, expected_scale = quantize_weight_symmetric_int8(
         expected_weight, 128
     )
 
     torch.testing.assert_close(layer.quantized_weight, expected_quantized)
-    torch.testing.assert_close(layer.weight_scale, expected_scale.reshape(-1))
+    torch.testing.assert_close(layer.weight_scale, expected_scale)
     assert layer.quantized_weight.shape == (24, 128)
-    assert layer.weight_scale.shape == (24,)
+    assert layer.weight_scale.shape == (24, 1)
     assert layer.bias is not None
     assert dict(layer.named_parameters()) == {}
 
@@ -54,12 +57,12 @@ def test_layer_rejects_non_multiple_of_64_hidden_dim() -> None:
     rmsnorm = nn.RMSNorm(96, eps=1e-6, dtype=torch.float16)
     linear = nn.Linear(96, 17, bias=False, dtype=torch.float16)
     with pytest.raises(ValueError, match="divisible by 64"):
-        FusedRMSNormLinearInt8(rmsnorm, linear)
+        FusedRMSNormLinearInt8Decode(rmsnorm, linear)
 
 
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("batch,seq_len", [(1, 1), (2, 4), (3, 3), (4, 128)])
-def test_cuda_matches_dispatched_reference(
+def test_explicit_cuda_layer_matches_reference(
     batch: int, seq_len: int, bias: bool
 ) -> None:
     if not torch.cuda.is_available():
@@ -79,11 +82,12 @@ def test_cuda_matches_dispatched_reference(
     x = torch.randn(
         batch, seq_len, hidden_dim, device="cuda", dtype=torch.float16
     ) / 4
-    layer = FusedRMSNormLinearInt8(rmsnorm, linear)
-
-    actual = layer(x)
     token_count = batch * seq_len
     if token_count <= 8:
+        layer = FusedRMSNormLinearInt8Decode(rmsnorm, linear)
+        actual = layer(x.reshape(token_count, 1, hidden_dim)).reshape(
+            batch, seq_len, out_dim
+        )
         expected = weight_only_int8_dequant_ref(
             x.reshape(token_count, 1, hidden_dim),
             layer.quantized_weight,
@@ -92,6 +96,8 @@ def test_cuda_matches_dispatched_reference(
             layer.bias,
         ).reshape(batch, seq_len, out_dim)
     else:
+        layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear)
+        actual = layer(x)
         expected = fused_rmsnorm_linear_int8_prefill_ref(
             x,
             layer.quantized_weight,

@@ -9,29 +9,52 @@ from layers.fused_rmsnorm_linear_int8.quantization import (
     quantize_weight_symmetric_int8,
 )
 
-from .cuda import fused_rmsnorm_linear_int8_prefill_cuda
+from .cuda import (
+    fused_add_rmsnorm_linear_int8_prefill_cuda,
+    fused_add_rmsnorm_linear_int8_prefill_out_cuda,
+    fused_rmsnorm_linear_int8_prefill_cuda,
+)
 
 
 class FusedRMSNormLinearInt8Prefill(nn.Module):
-    """Use per-token/per-output INT8 quantization for prefill inference."""
+    """Use per-token/per-output INT8 quantization for prefill inference.
 
-    def __init__(self, rmsnorm: nn.Module, linear: nn.Linear) -> None:
+    Fused-add calls reuse persistent outputs and quantization workspace by
+    default. A later call with the same input shape overwrites tensors returned
+    by the previous call. Disable ``reuse_output_buffers`` when callers need
+    immutable outputs across calls.
+    """
+
+    def __init__(
+        self,
+        rmsnorm: nn.Module,
+        linear: nn.Linear,
+        reuse_output_buffers: bool = True,
+    ) -> None:
         super().__init__()
         rms_weight = getattr(rmsnorm, "weight", None)
         if not isinstance(rms_weight, torch.Tensor) or rms_weight.ndim != 1:
             raise TypeError("rmsnorm must expose one-dimensional weight")
         if linear.in_features != rms_weight.numel():
             raise ValueError("RMSNorm HiddenDim must match Linear in_features")
-        if linear.weight.dtype != torch.float16 or rms_weight.dtype != torch.float16:
-            raise TypeError("source weights must be float16")
+        if linear.weight.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("source weights must be float16 or bfloat16")
+        if rms_weight.dtype != linear.weight.dtype:
+            raise TypeError("RMSNorm and Linear weights must have the same dtype")
         if linear.weight.device != rms_weight.device:
             raise ValueError("source weights must be on the same device")
         if linear.in_features % 32 or linear.out_features % 8:
             raise ValueError("HiddenDim must be divisible by 32 and OutDim by 8")
         eps = getattr(rmsnorm, "variance_epsilon", getattr(rmsnorm, "eps", None))
-        self.eps = float(torch.finfo(torch.float16).eps if eps is None else eps)
+        self.eps = float(torch.finfo(linear.weight.dtype).eps if eps is None else eps)
         self.hidden_dim = linear.in_features
         self.out_dim = linear.out_features
+        self.compute_dtype = linear.weight.dtype
+        self.reuse_output_buffers = reuse_output_buffers
+        self._fused_add_buffers: dict[
+            tuple[int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         with torch.no_grad():
             fused_weight = linear.weight * rms_weight.unsqueeze(0)
             quantized_weight, weight_scale = quantize_weight_symmetric_int8(
@@ -44,14 +67,70 @@ class FusedRMSNormLinearInt8Prefill(nn.Module):
             None if linear.bias is None else linear.bias.detach().clone().contiguous(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return output shaped [Batch, SeqLen, OutDim]."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_res: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Return output, plus the updated residual when ``x_res`` is given."""
         if x.ndim != 3 or x.shape[2] != self.hidden_dim:
             raise ValueError("x must have shape [Batch, SeqLen, HiddenDim]")
-        if x.dtype != torch.float16 or not x.is_contiguous():
-            raise TypeError("x must be contiguous float16")
+        if x.dtype != self.compute_dtype or not x.is_contiguous():
+            raise TypeError(
+                f"x must be contiguous {self.compute_dtype}"
+            )
         if x.device != self.quantized_weight.device:
             raise ValueError("x and weight must be on the same device")
+        if x_res is not None:
+            if x_res.shape != x.shape:
+                raise ValueError("x_res must have the same shape as x")
+            if x_res.dtype != x.dtype or x_res.device != x.device:
+                raise ValueError("x_res must have the same dtype and device as x")
+            if not x_res.is_contiguous():
+                raise TypeError("x_res must be contiguous")
+            if not self.reuse_output_buffers:
+                return fused_add_rmsnorm_linear_int8_prefill_cuda(
+                    x,
+                    x_res,
+                    self.quantized_weight,
+                    self.weight_scale,
+                    self.bias,
+                    self.eps,
+                )
+            shape_key = (x.shape[0], x.shape[1])
+            buffers = self._fused_add_buffers.get(shape_key)
+            if buffers is None:
+                rows = x.shape[0] * x.shape[1]
+                buffers = (
+                    torch.empty(
+                        rows,
+                        self.hidden_dim,
+                        device=x.device,
+                        dtype=torch.int8,
+                    ),
+                    torch.empty(rows, device=x.device, dtype=torch.float32),
+                    torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.out_dim,
+                        device=x.device,
+                        dtype=x.dtype,
+                    ),
+                    torch.empty_like(x),
+                )
+                self._fused_add_buffers[shape_key] = buffers
+            return fused_add_rmsnorm_linear_int8_prefill_out_cuda(
+                x,
+                x_res,
+                self.quantized_weight,
+                self.weight_scale,
+                self.bias,
+                self.eps,
+                buffers[0],
+                buffers[1],
+                buffers[2],
+                buffers[3],
+            )
         return fused_rmsnorm_linear_int8_prefill_cuda(
             x,
             self.quantized_weight,

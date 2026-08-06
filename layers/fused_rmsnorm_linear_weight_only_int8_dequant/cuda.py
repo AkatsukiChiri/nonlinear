@@ -1,4 +1,4 @@
-"""Loader for the FP16-dequantized weight-only INT8 CUDA extension."""
+"""Loader for the FP16/BF16 weight-only INT8 CUDA extension."""
 
 from __future__ import annotations
 
@@ -35,7 +35,48 @@ def weight_only_int8_dequant_cuda(
     bias: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
-    """Dispatch the FP16-dequantized weight-only kernel."""
+    """Dispatch the dtype-specialized weight-only kernel."""
     if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
         raise RuntimeError("weight-only INT8 currently requires an Ampere GPU")
     return _load_extension().forward(x, quantized_weight, weight_scale, bias, eps)
+
+
+def fused_add_weight_only_int8_dequant_cuda(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    quantized_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse residual add with the dtype-specialized decode kernel."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
+        raise RuntimeError("fused-add weight-only INT8 requires an Ampere GPU")
+    output, residual_sum = _load_extension().forward_add(
+        x, x_res, quantized_weight, weight_scale, bias, eps
+    )
+    return output, residual_sum
+
+
+def fused_add_weight_only_int8_dequant_out_cuda(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    quantized_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    output: torch.Tensor,
+    residual_sum: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused-add decode into persistent output buffers."""
+    result, residual = _load_extension().forward_add_out(
+        x,
+        x_res,
+        quantized_weight,
+        weight_scale,
+        bias,
+        eps,
+        output,
+        residual_sum,
+    )
+    return result, residual

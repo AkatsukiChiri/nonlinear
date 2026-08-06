@@ -28,3 +28,19 @@ def fused_rmsnorm_linear_int8_prefill_ref(
     if bias is not None:
         output = output + bias.float()
     return output.to(x.dtype).reshape(batch, seq_len, -1)
+
+
+def fused_add_rmsnorm_linear_int8_prefill_ref(
+    x: torch.Tensor,
+    x_res: torch.Tensor,
+    quantized_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    eps: float,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference residual add followed by W8A8 RMSNorm + Linear."""
+    residual_sum = x + x_res
+    output = fused_rmsnorm_linear_int8_prefill_ref(
+        residual_sum, quantized_weight, weight_scale, eps, bias
+    )
+    return output, residual_sum
