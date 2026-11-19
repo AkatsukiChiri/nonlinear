@@ -41,6 +41,22 @@ def weight_only_int8_dequant_cuda(
     return _load_extension().forward(x, quantized_weight, weight_scale, bias, eps)
 
 
+def weight_only_int8_dequant_out_cuda(
+    x: torch.Tensor,
+    quantized_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run weight-only decode into a persistent output buffer."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
+        raise RuntimeError("weight-only INT8 currently requires an Ampere GPU")
+    return _load_extension().forward_out(
+        x, quantized_weight, weight_scale, bias, eps, output
+    )
+
+
 def fused_add_weight_only_int8_dequant_cuda(
     x: torch.Tensor,
     x_res: torch.Tensor,

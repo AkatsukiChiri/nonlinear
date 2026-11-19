@@ -21,8 +21,9 @@ void launch_projection_add_bf16(
     const float*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
     float*, int, int, int, float, cudaStream_t);
 
-torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
-                      std::optional<torch::Tensor> bias, double eps) {
+torch::Tensor run_forward(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
+    std::optional<torch::Tensor> bias, double eps, torch::Tensor output) {
   TORCH_CHECK(x.is_cuda() && weight.is_cuda() && scale.is_cuda(), "inputs must be CUDA");
   TORCH_CHECK(x.device() == weight.device() && x.device() == scale.device(), "device mismatch");
   TORCH_CHECK(x.scalar_type() == torch::kFloat16 ||
@@ -41,11 +42,19 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale
     TORCH_CHECK(bias->scalar_type() == x.scalar_type() && bias->dim() == 1 &&
                 bias->size(0) == weight.size(0) && bias->is_contiguous(), "invalid bias");
   }
+  TORCH_CHECK(output.is_cuda() && output.device() == x.device() &&
+              output.scalar_type() == x.scalar_type() &&
+              output.sizes() == torch::IntArrayRef(
+                  {x.size(0), 1, weight.size(0)}) && output.is_contiguous(),
+              "output buffer has an invalid shape, dtype, device, or layout");
   const c10::cuda::CUDAGuard guard(x.device());
-  auto output = torch::empty({x.size(0), 1, weight.size(0)}, x.options());
-  auto partial = torch::empty({4, x.size(0), weight.size(0)},
-                              x.options().dtype(torch::kFloat32));
-  auto square_sum = torch::empty({x.size(0)}, x.options().dtype(torch::kFloat32));
+  torch::Tensor square_sum;
+  float* square_sum_pointer = nullptr;
+  if (x.size(0) > 2) {
+    square_sum = torch::empty(
+        {x.size(0)}, x.options().dtype(torch::kFloat32));
+    square_sum_pointer = square_sum.data_ptr<float>();
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (x.scalar_type() == torch::kFloat16) {
     const half* bias_pointer = bias.has_value()
@@ -54,7 +63,7 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale
         reinterpret_cast<const signed char*>(weight.data_ptr<int8_t>()),
         scale.data_ptr<float>(), bias_pointer,
         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        partial.data_ptr<float>(), square_sum.data_ptr<float>(), x.size(0),
+        nullptr, square_sum_pointer, x.size(0),
         weight.size(0), x.size(2), static_cast<float>(eps), stream);
   } else {
     const __nv_bfloat16* bias_pointer = bias.has_value()
@@ -66,11 +75,25 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale
         reinterpret_cast<const signed char*>(weight.data_ptr<int8_t>()),
         scale.data_ptr<float>(), bias_pointer,
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-        square_sum.data_ptr<float>(), x.size(0), weight.size(0), x.size(2),
+        square_sum_pointer, x.size(0), weight.size(0), x.size(2),
         static_cast<float>(eps), stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
+}
+
+torch::Tensor forward(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
+                      std::optional<torch::Tensor> bias, double eps) {
+  auto output = torch::empty({x.size(0), 1, weight.size(0)}, x.options());
+  return run_forward(std::move(x), std::move(weight), std::move(scale),
+                     std::move(bias), eps, std::move(output));
+}
+
+torch::Tensor forward_out(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
+    std::optional<torch::Tensor> bias, double eps, torch::Tensor output) {
+  return run_forward(std::move(x), std::move(weight), std::move(scale),
+                     std::move(bias), eps, std::move(output));
 }
 
 std::vector<torch::Tensor> run_forward_add(
@@ -178,6 +201,7 @@ std::vector<torch::Tensor> forward_add_out(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("forward", &forward);
+  module.def("forward_out", &forward_out);
   module.def("forward_add", &forward_add);
   module.def("forward_add_out", &forward_add_out);
 }

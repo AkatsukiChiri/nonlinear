@@ -55,12 +55,22 @@ __global__ __launch_bounds__(kQuantThreads) void quantize_rms_kernel(
   float local_sum = 0.0f;
   const int row = blockIdx.x;
   const Input* input = x + row * hidden_dim;
-  for (int index = threadIdx.x; index < hidden_dim; index += blockDim.x) {
-    const Input value_raw = input[index];
-    shared_x[index] = value_raw;
-    const float value = input_to_float(value_raw);
-    local_max = fmaxf(local_max, fabsf(value));
-    local_sum = fmaf(value, value, local_sum);
+  for (int index = threadIdx.x * 2; index < hidden_dim;
+       index += blockDim.x * 2) {
+    float2 values;
+    if constexpr (std::is_same_v<Input, half>) {
+      const half2 pair = *reinterpret_cast<const half2*>(input + index);
+      *reinterpret_cast<half2*>(shared_x + index) = pair;
+      values = __half22float2(pair);
+    } else {
+      const __nv_bfloat162 pair =
+          *reinterpret_cast<const __nv_bfloat162*>(input + index);
+      *reinterpret_cast<__nv_bfloat162*>(shared_x + index) = pair;
+      values = __bfloat1622float2(pair);
+    }
+    local_max = fmaxf(local_max, fmaxf(fabsf(values.x), fabsf(values.y)));
+    local_sum = fmaf(values.x, values.x, local_sum);
+    local_sum = fmaf(values.y, values.y, local_sum);
   }
   for (int offset = 16; offset; offset >>= 1) {
     local_max = fmaxf(local_max,
@@ -91,10 +101,26 @@ __global__ __launch_bounds__(kQuantThreads) void quantize_rms_kernel(
   }
   __syncthreads();
   const float inverse_scale = 1.0f / scale_shared;
-  for (int index = threadIdx.x; index < hidden_dim; index += blockDim.x) {
-    int value = __float2int_rn(input_to_float(shared_x[index]) * inverse_scale);
-    value = max(-127, min(127, value));
-    quantized_x[row * hidden_dim + index] = static_cast<int8_t>(value);
+  for (int index = threadIdx.x * 2; index < hidden_dim;
+       index += blockDim.x * 2) {
+    float2 values;
+    if constexpr (std::is_same_v<Input, half>) {
+      values = __half22float2(
+          *reinterpret_cast<const half2*>(shared_x + index));
+    } else {
+      values = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162*>(shared_x + index));
+    }
+    int value_0 = __float2int_rn(values.x * inverse_scale);
+    int value_1 = __float2int_rn(values.y * inverse_scale);
+    value_0 = max(-127, min(127, value_0));
+    value_1 = max(-127, min(127, value_1));
+    const unsigned short packed =
+        static_cast<unsigned char>(static_cast<int8_t>(value_0)) |
+        (static_cast<unsigned short>(
+             static_cast<unsigned char>(static_cast<int8_t>(value_1))) << 8);
+    *reinterpret_cast<unsigned short*>(
+        quantized_x + row * hidden_dim + index) = packed;
   }
 }
 
@@ -250,7 +276,7 @@ void launch_quantize_add_rms_int8_prefill_bf16(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename Output, typename CudaOutput>
+template <typename Output, typename CudaOutput, int TileM, int WarpM = 32>
 void launch_gemm_int8_prefill_typed(
     const int8_t* x, const int8_t* weight, const float* row_scale,
     const float* weight_scale, const CudaOutput* bias, CudaOutput* output,
@@ -258,8 +284,8 @@ void launch_gemm_int8_prefill_typed(
   using Element = cutlass::int8_t;
   using Accumulator = int32_t;
   using Compute = float;
-  using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-  using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+  using ThreadblockShape = cutlass::gemm::GemmShape<TileM, 128, 64>;
+  using WarpShape = cutlass::gemm::GemmShape<WarpM, 64, 64>;
   using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
   using OutputTileThreadMap =
       cutlass::epilogue::threadblock::OutputTileThreadLayout<
@@ -335,9 +361,23 @@ void launch_gemm_int8_prefill(const int8_t* x, const int8_t* weight,
                               const float* weight_scale, const half* bias,
                               half* output, int rows, int out_dim,
                               int hidden_dim, cudaStream_t stream) {
-  launch_gemm_int8_prefill_typed<cutlass::half_t>(
-      x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
-      hidden_dim, stream);
+  if (rows <= 16) {
+    launch_gemm_int8_prefill_typed<cutlass::half_t, half, 16, 16>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else if (rows <= 32) {
+    launch_gemm_int8_prefill_typed<cutlass::half_t, half, 32>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else if (rows <= 64) {
+    launch_gemm_int8_prefill_typed<cutlass::half_t, half, 64>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else {
+    launch_gemm_int8_prefill_typed<cutlass::half_t, half, 128>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  }
 }
 
 void launch_gemm_int8_prefill_bf16(
@@ -345,7 +385,21 @@ void launch_gemm_int8_prefill_bf16(
     const float* weight_scale, const __nv_bfloat16* bias,
     __nv_bfloat16* output, int rows, int out_dim, int hidden_dim,
     cudaStream_t stream) {
-  launch_gemm_int8_prefill_typed<cutlass::bfloat16_t>(
-      x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
-      hidden_dim, stream);
+  if (rows <= 16) {
+    launch_gemm_int8_prefill_typed<cutlass::bfloat16_t, __nv_bfloat16, 16, 16>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else if (rows <= 32) {
+    launch_gemm_int8_prefill_typed<cutlass::bfloat16_t, __nv_bfloat16, 32>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else if (rows <= 64) {
+    launch_gemm_int8_prefill_typed<cutlass::bfloat16_t, __nv_bfloat16, 64>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  } else {
+    launch_gemm_int8_prefill_typed<cutlass::bfloat16_t, __nv_bfloat16, 128>(
+        x, weight, row_scale, weight_scale, bias, output, rows, out_dim,
+        hidden_dim, stream);
+  }
 }

@@ -52,6 +52,31 @@ def fused_rmsnorm_linear_int8_prefill_cuda(
     return _load_extension().forward(x, weight, weight_scale, bias, eps)
 
 
+def fused_rmsnorm_linear_int8_prefill_out_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    quantized_x: torch.Tensor,
+    row_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run prefill into persistent quantization and output buffers."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 8:
+        raise RuntimeError("INT8 prefill requires an Ampere GPU")
+    return _load_extension().forward_out(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        eps,
+        quantized_x,
+        row_scale,
+        output,
+    )
+
+
 def fused_add_rmsnorm_linear_int8_prefill_cuda(
     x: torch.Tensor,
     x_res: torch.Tensor,

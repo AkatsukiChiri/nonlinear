@@ -144,3 +144,29 @@ def test_fused_add_prefill_reuses_output_and_workspace_buffers() -> None:
     assert first_output.data_ptr() == second_output.data_ptr()
     assert first_residual.data_ptr() == second_residual.data_ptr()
     assert len(layer._fused_add_buffers) == 1
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_prefill_accepts_vllm_flat_token_layout(with_residual: bool) -> None:
+    _require_ampere()
+    torch.manual_seed(20260812)
+    rmsnorm = nn.RMSNorm(128, eps=1e-6, device="cuda", dtype=torch.float16)
+    linear = nn.Linear(128, 96, bias=False, device="cuda", dtype=torch.float16)
+    layer = FusedRMSNormLinearInt8Prefill(rmsnorm, linear)
+    x = torch.randn(17, 128, device="cuda", dtype=torch.float16) / 4
+    x_res = torch.randn_like(x) / 4 if with_residual else None
+
+    actual = layer(x, x_res)
+    expected = layer(
+        x.reshape(1, 17, 128),
+        None if x_res is None else x_res.reshape(1, 17, 128),
+    )
+
+    if with_residual:
+        assert isinstance(actual, tuple) and isinstance(expected, tuple)
+        torch.testing.assert_close(actual[0], expected[0].reshape(17, 96))
+        torch.testing.assert_close(actual[1], expected[1].reshape(17, 128))
+    else:
+        assert isinstance(actual, torch.Tensor)
+        assert isinstance(expected, torch.Tensor)
+        torch.testing.assert_close(actual, expected.reshape(17, 96))

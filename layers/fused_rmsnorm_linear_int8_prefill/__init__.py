@@ -8,11 +8,16 @@ from torch import nn
 from layers.fused_rmsnorm_linear_int8.quantization import (
     quantize_weight_symmetric_int8,
 )
+from layers.fused_rmsnorm_linear_int8.quantized import (
+    adapt_quantized_linear,
+    fold_rmsnorm_into_quantized_weight,
+)
 
 from .cuda import (
     fused_add_rmsnorm_linear_int8_prefill_cuda,
     fused_add_rmsnorm_linear_int8_prefill_out_cuda,
     fused_rmsnorm_linear_int8_prefill_cuda,
+    fused_rmsnorm_linear_int8_prefill_out_cuda,
 )
 
 
@@ -55,6 +60,10 @@ class FusedRMSNormLinearInt8Prefill(nn.Module):
             tuple[int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._output_buffers: dict[
+            tuple[int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         with torch.no_grad():
             fused_weight = linear.weight * rms_weight.unsqueeze(0)
             quantized_weight, weight_scale = quantize_weight_symmetric_int8(
@@ -67,14 +76,86 @@ class FusedRMSNormLinearInt8Prefill(nn.Module):
             None if linear.bias is None else linear.bias.detach().clone().contiguous(),
         )
 
+    @classmethod
+    def from_quantized_linear(
+        cls,
+        rmsnorm: nn.Module,
+        linear: nn.Module,
+        chunk_size: int = 1024,
+        reuse_output_buffers: bool = True,
+    ) -> "FusedRMSNormLinearInt8Prefill":
+        """Construct from a loaded vLLM-style per-channel INT8 Linear."""
+        rms_weight = getattr(rmsnorm, "weight", None)
+        if not isinstance(rms_weight, torch.Tensor) or rms_weight.ndim != 1:
+            raise TypeError("rmsnorm must expose a one-dimensional weight")
+        if rms_weight.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("RMSNorm weight must be float16 or bfloat16")
+        quantized = adapt_quantized_linear(linear)
+        if quantized.input_size % 32 or quantized.output_size % 8:
+            raise ValueError("HiddenDim must be divisible by 32 and OutDim by 8")
+        fused_weight, fused_scale = fold_rmsnorm_into_quantized_weight(
+            rms_weight, quantized, chunk_size
+        )
+
+        layer = cls.__new__(cls)
+        nn.Module.__init__(layer)
+        eps = getattr(rmsnorm, "variance_epsilon", getattr(rmsnorm, "eps", None))
+        layer.eps = float(
+            torch.finfo(rms_weight.dtype).eps if eps is None else eps
+        )
+        layer.hidden_dim = quantized.input_size
+        layer.out_dim = quantized.output_size
+        layer.compute_dtype = rms_weight.dtype
+        layer.logical_widths = quantized.logical_widths
+        layer.reuse_output_buffers = reuse_output_buffers
+        layer._fused_add_buffers = {}
+        layer._output_buffers = {}
+        layer.register_buffer("quantized_weight", fused_weight)
+        layer.register_buffer("weight_scale", fused_scale)
+        layer.register_buffer(
+            "bias",
+            None
+            if quantized.bias is None
+            else quantized.bias.detach().to(rms_weight.dtype).clone().contiguous(),
+        )
+        return layer
+
     def forward(
+        self,
+        x: torch.Tensor,
+        x_res: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Accept vLLM's flat tokens without recursively dispatching Python."""
+        if x.ndim != 2:
+            return self._forward_3d(x, x_res)
+        if x.shape[1] != self.hidden_dim:
+            raise ValueError("x must have shape [NumTokens, HiddenDim]")
+        num_tokens = x.shape[0]
+        x_3d = x.reshape(1, num_tokens, self.hidden_dim)
+        x_res_3d = (
+            None
+            if x_res is None
+            else x_res.reshape(1, num_tokens, self.hidden_dim)
+        )
+        result = self._forward_3d(x_3d, x_res_3d)
+        if isinstance(result, tuple):
+            return (
+                result[0].reshape(num_tokens, self.out_dim),
+                result[1].reshape(num_tokens, self.hidden_dim),
+            )
+        return result.reshape(num_tokens, self.out_dim)
+
+    def _forward_3d(
         self,
         x: torch.Tensor,
         x_res: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Return output, plus the updated residual when ``x_res`` is given."""
         if x.ndim != 3 or x.shape[2] != self.hidden_dim:
-            raise ValueError("x must have shape [Batch, SeqLen, HiddenDim]")
+            raise ValueError(
+                "x must have shape [NumTokens, HiddenDim] or "
+                "[Batch, SeqLen, HiddenDim]"
+            )
         if x.dtype != self.compute_dtype or not x.is_contiguous():
             raise TypeError(
                 f"x must be contiguous {self.compute_dtype}"
@@ -130,6 +211,38 @@ class FusedRMSNormLinearInt8Prefill(nn.Module):
                 buffers[1],
                 buffers[2],
                 buffers[3],
+            )
+        if self.reuse_output_buffers:
+            shape_key = (x.shape[0], x.shape[1])
+            buffers = self._output_buffers.get(shape_key)
+            if buffers is None:
+                rows = x.shape[0] * x.shape[1]
+                buffers = (
+                    torch.empty(
+                        rows,
+                        self.hidden_dim,
+                        device=x.device,
+                        dtype=torch.int8,
+                    ),
+                    torch.empty(rows, device=x.device, dtype=torch.float32),
+                    torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.out_dim,
+                        device=x.device,
+                        dtype=x.dtype,
+                    ),
+                )
+                self._output_buffers[shape_key] = buffers
+            return fused_rmsnorm_linear_int8_prefill_out_cuda(
+                x,
+                self.quantized_weight,
+                self.weight_scale,
+                self.bias,
+                self.eps,
+                buffers[0],
+                buffers[1],
+                buffers[2],
             )
         return fused_rmsnorm_linear_int8_prefill_cuda(
             x,
