@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from benchmark.fused_rmsnorm_linear_w4a16_global_sentinel.bench_global_sentinel import (
+from benchmark.fused_rmsnorm_linear_w4a16_marlin.baseline import (
     DEFAULT_MODEL,
     load_tensors,
     make_native_marlin,

@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from benchmark.fused_rmsnorm_linear_w4a16_global_sentinel.bench_global_sentinel import (
+from benchmark.fused_rmsnorm_linear_w4a16_marlin.baseline import (
     make_native_marlin,
 )
 from layers.fused_rmsnorm_linear_w4a16_marlin.layer import FusedRMSNormLinearW4A16Marlin
